@@ -1,0 +1,67 @@
+# ── Rust / build ─────────────────────────────────────────────
+/target
+Cargo.lock.orig
+*.rs.bk
+pkg/
+*.rpm
+*.deb
+
+# ── Environment / secrets ────────────────────────────────────
+.env
+.env.*
+!.env.example
+*.local
+*.key
+*.pem
+*.crt
+
+# ── AI tools (agents / copilots / indexers) ──────────────────
+.ai/
+.aider*
+.agent/
+.anthropic/
+.claude/
+.codex/
+.codex-patches/
+.continue/
+.copilot/
+.cursor/
+.gemini/
+.github/copilot/
+.roo/
+.windsurf/
+.pi/
+.pi-subagents/
+.codegraph/
+.codebase-index/
+
+# ── Editors / IDEs ───────────────────────────────────────────
+.vscode/
+.vscode-server/
+.idea/
+*.iml
+.zed/
+*.swp
+*.swo
+*~
+
+# ── OS ───────────────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+.AppleDouble
+.LSOverride
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# ── Logs / temp ──────────────────────────────────────────────
+*.log
+tmp/
+temp/
+
+# ── Project-local notes / planning ───────────────────────────
+openspec/
+plan/
+todo/
+tasks/

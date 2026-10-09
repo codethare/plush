@@ -1,0 +1,445 @@
+//! The Wayland side: one layer-shell card per notification.
+//!
+//! Cards are never resized by content they already know — the compositor's
+//! `configure` is the only place a card is drawn, so surface state and buffer
+//! state can never disagree.
+
+use std::time::Instant;
+
+use calloop::{LoopHandle, RegistrationToken};
+use cosmic_text::{Buffer, FontSystem, SwashCache};
+use smithay_client_toolkit::{
+    compositor::{CompositorHandler, CompositorState},
+    delegate_registry,
+    output::{OutputHandler, OutputState},
+    registry::{ProvidesRegistryState, RegistryState},
+    registry_handlers,
+    seat::{
+        pointer::{PointerEvent, PointerEventKind, PointerHandler},
+        Capability, SeatHandler, SeatState,
+    },
+    shell::{
+        wlr_layer::{
+            Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface,
+            LayerSurfaceConfigure,
+        },
+        WaylandSurface,
+    },
+    shm::{slot::SlotPool, Shm, ShmHandler},
+};
+use wayland_client::{
+    globals::GlobalList,
+    protocol::{wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
+    Connection, QueueHandle,
+};
+
+use crate::{
+    dbus::{CloseRequest, Notification, Shared, REASON_DISMISSED, REASON_EXPIRED},
+    render,
+};
+
+/// Distance from the screen edge, in logical pixels.
+const MARGIN: i32 = 16;
+/// Space between stacked cards.
+const GAP: i32 = 10;
+
+struct Card {
+    id: u32,
+    /// The text this card was built from, so a `replaces_id` update is detected.
+    source: (String, String, String),
+    surface: LayerSurface,
+    content: Buffer,
+    height: u32,
+    deadline: Option<Instant>,
+}
+
+fn source_of(notification: &Notification) -> (String, String, String) {
+    (
+        notification.app_name.clone(),
+        notification.summary.clone(),
+        notification.body.clone(),
+    )
+}
+
+pub struct Ui {
+    qh: QueueHandle<Ui>,
+    handle: LoopHandle<'static, Ui>,
+    registry_state: RegistryState,
+    seat_state: SeatState,
+    output_state: OutputState,
+    compositor: CompositorState,
+    layer_shell: LayerShell,
+    shm: Shm,
+    pool: SlotPool,
+    font_system: FontSystem,
+    swash: SwashCache,
+    store: Shared,
+    closed: async_channel::Sender<CloseRequest>,
+    cards: Vec<Card>,
+    pointer: Option<wl_pointer::WlPointer>,
+    expiry: Option<RegistrationToken>,
+}
+
+impl Ui {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        qh: QueueHandle<Ui>,
+        handle: LoopHandle<'static, Ui>,
+        globals: &GlobalList,
+        compositor: CompositorState,
+        layer_shell: LayerShell,
+        shm: Shm,
+        pool: SlotPool,
+        store: Shared,
+        closed: async_channel::Sender<CloseRequest>,
+    ) -> Self {
+        Self {
+            registry_state: RegistryState::new(globals),
+            seat_state: SeatState::new(globals, &qh),
+            output_state: OutputState::new(globals, &qh),
+            qh,
+            handle,
+            compositor,
+            layer_shell,
+            shm,
+            pool,
+            font_system: FontSystem::new(),
+            swash: SwashCache::new(),
+            store,
+            closed,
+            cards: Vec::new(),
+            pointer: None,
+            expiry: None,
+        }
+    }
+
+    /// Brings the on-screen cards in line with the shared queue. The only place
+    /// cards are created, destroyed or re-stacked.
+    pub fn sync(&mut self) {
+        let items: Vec<Notification> = {
+            let mut store = self.store.lock().unwrap();
+            if store.items.len() > render::MAX_CARDS {
+                for dropped in store.items.drain(render::MAX_CARDS..) {
+                    let _ = self
+                        .closed
+                        .try_send(CloseRequest { id: dropped.id, reason: REASON_EXPIRED });
+                }
+            }
+            store.items.clone()
+        };
+
+        // Keep the cards that still exist, in queue order, building the new ones.
+        // A card whose text changed is rebuilt rather than patched: a fresh surface
+        // is what makes the compositor hand us a `configure` to draw with.
+        let mut ordered = Vec::with_capacity(items.len());
+        for notification in &items {
+            let unchanged = self
+                .cards
+                .iter()
+                .position(|card| card.id == notification.id && card.source == source_of(notification));
+            match unchanged {
+                Some(index) => ordered.push(self.cards.remove(index)),
+                None => {
+                    self.cards.retain(|card| card.id != notification.id);
+                    ordered.push(self.make_card(notification));
+                }
+            }
+        }
+        self.cards = ordered;
+
+        let mut offset = MARGIN;
+        for card in &mut self.cards {
+            card.surface.set_margin(offset, 0, 0, MARGIN);
+            card.surface.commit();
+            offset += card.height as i32 + GAP;
+        }
+
+        self.rearm();
+    }
+
+    fn make_card(&mut self, notification: &Notification) -> Card {
+        let mut content = render::build(&mut self.font_system, notification);
+        let height = render::card_height(&mut self.font_system, &mut content);
+
+        let surface = self.compositor.create_surface(&self.qh);
+        let card = self.layer_shell.create_layer_surface(
+            &self.qh,
+            surface,
+            Layer::Overlay,
+            Some("plush"),
+            None,
+        );
+        card.set_anchor(Anchor::TOP | Anchor::RIGHT);
+        // -1: never reserve space, so windows may use the full screen under us.
+        card.set_exclusive_zone(-1);
+        card.set_keyboard_interactivity(KeyboardInteractivity::None);
+        card.set_size(render::PANEL_W, height);
+        // An initial commit with no buffer; the configure it triggers is what draws.
+        card.commit();
+
+        Card {
+            id: notification.id,
+            source: source_of(notification),
+            surface: card,
+            content,
+            height,
+            deadline: notification.timeout.map(|timeout| Instant::now() + timeout),
+        }
+    }
+
+    fn remove(&mut self, id: u32, reason: u32) {
+        self.store.lock().unwrap().items.retain(|n| n.id != id);
+        let _ = self.closed.try_send(CloseRequest { id, reason });
+        self.sync();
+    }
+
+    fn expire(&mut self) {
+        let now = Instant::now();
+        let expired: Vec<u32> = self
+            .cards
+            .iter()
+            .filter(|card| card.deadline.is_some_and(|deadline| deadline <= now))
+            .map(|card| card.id)
+            .collect();
+        if expired.is_empty() {
+            return;
+        }
+        self.store
+            .lock()
+            .unwrap()
+            .items
+            .retain(|n| !expired.contains(&n.id));
+        for id in expired {
+            let _ = self.closed.try_send(CloseRequest { id, reason: REASON_EXPIRED });
+        }
+        self.sync();
+    }
+
+    /// One timer for the earliest deadline, replaced whenever the stack changes.
+    fn rearm(&mut self) {
+        if let Some(token) = self.expiry.take() {
+            self.handle.remove(token);
+        }
+        let deadline = self.cards.iter().filter_map(|card| card.deadline).min();
+        let Some(deadline) = deadline else {
+            return;
+        };
+        let timer = calloop::timer::Timer::from_duration(
+            deadline.saturating_duration_since(Instant::now()),
+        );
+        self.expiry = self
+            .handle
+            .insert_source(timer, |_, _, ui: &mut Ui| {
+                ui.expire();
+                calloop::timer::TimeoutAction::Drop
+            })
+            .ok();
+    }
+}
+
+impl CompositorHandler for Ui {
+    fn scale_factor_changed(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _surface: &wl_surface::WlSurface,
+        _new_factor: i32,
+    ) {
+    }
+
+    fn transform_changed(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _surface: &wl_surface::WlSurface,
+        _new_transform: wl_output::Transform,
+    ) {
+    }
+
+    fn frame(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _surface: &wl_surface::WlSurface,
+        _time: u32,
+    ) {
+    }
+
+    fn surface_enter(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _surface: &wl_surface::WlSurface,
+        _output: &wl_output::WlOutput,
+    ) {
+    }
+
+    fn surface_leave(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _surface: &wl_surface::WlSurface,
+        _output: &wl_output::WlOutput,
+    ) {
+    }
+}
+
+impl OutputHandler for Ui {
+    fn output_state(&mut self) -> &mut OutputState {
+        &mut self.output_state
+    }
+
+    fn new_output(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _output: wl_output::WlOutput) {
+    }
+
+    fn update_output(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _output: wl_output::WlOutput,
+    ) {
+    }
+
+    fn output_destroyed(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _output: wl_output::WlOutput,
+    ) {
+    }
+}
+
+impl LayerShellHandler for Ui {
+    fn closed(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, layer: &LayerSurface) {
+        if let Some(id) = self
+            .cards
+            .iter()
+            .find(|card| &card.surface == layer)
+            .map(|card| card.id)
+        {
+            self.remove(id, REASON_EXPIRED);
+        }
+    }
+
+    fn configure(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        layer: &LayerSurface,
+        configure: LayerSurfaceConfigure,
+        _serial: u32,
+    ) {
+        let (width, height) = configure.new_size;
+        if width == 0 || height == 0 {
+            return;
+        }
+        let Some(card) = self.cards.iter_mut().find(|card| &card.surface == layer) else {
+            return;
+        };
+
+        let stride = width as i32 * 4;
+        let Ok((buffer, canvas)) = self.pool.create_buffer(
+            width as i32,
+            height as i32,
+            stride,
+            wl_shm::Format::Argb8888,
+        ) else {
+            return;
+        };
+
+        render::paint(
+            canvas,
+            width,
+            height,
+            &mut self.font_system,
+            &mut self.swash,
+            &mut card.content,
+        );
+
+        card.surface.wl_surface().damage_buffer(0, 0, width as i32, height as i32);
+        if buffer.attach_to(card.surface.wl_surface()).is_ok() {
+            card.surface.commit();
+        }
+    }
+}
+
+impl SeatHandler for Ui {
+    fn seat_state(&mut self) -> &mut SeatState {
+        &mut self.seat_state
+    }
+
+    fn new_seat(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _seat: wl_seat::WlSeat) {}
+
+    fn new_capability(
+        &mut self,
+        _conn: &Connection,
+        qh: &QueueHandle<Self>,
+        seat: wl_seat::WlSeat,
+        capability: Capability,
+    ) {
+        // No keyboard: cards never take focus, so they never steal typing.
+        if capability == Capability::Pointer && self.pointer.is_none() {
+            self.pointer = self.seat_state.get_pointer(qh, &seat).ok();
+        }
+    }
+
+    fn remove_capability(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _seat: wl_seat::WlSeat,
+        capability: Capability,
+    ) {
+        if capability == Capability::Pointer {
+            if let Some(pointer) = self.pointer.take() {
+                pointer.release();
+            }
+        }
+    }
+
+    fn remove_seat(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _seat: wl_seat::WlSeat) {
+    }
+}
+
+impl PointerHandler for Ui {
+    fn pointer_frame(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _pointer: &wl_pointer::WlPointer,
+        events: &[PointerEvent],
+    ) {
+        for event in events {
+            if !matches!(event.kind, PointerEventKind::Press { .. }) {
+                continue;
+            }
+            let target = self
+                .cards
+                .iter()
+                .find(|card| card.surface.wl_surface() == &event.surface)
+                .map(|card| card.id);
+            // Dismiss the frontmost hit and stop: `remove` rebuilds the card list.
+            if let Some(id) = target {
+                self.remove(id, REASON_DISMISSED);
+                return;
+            }
+        }
+    }
+}
+
+impl ShmHandler for Ui {
+    fn shm_state(&mut self) -> &mut Shm {
+        &mut self.shm
+    }
+}
+
+delegate_registry!(Ui);
+
+impl ProvidesRegistryState for Ui {
+    fn registry(&mut self) -> &mut RegistryState {
+        &mut self.registry_state
+    }
+    registry_handlers![OutputState, SeatState];
+}
+
+smithay_client_toolkit::delegate_dispatch2!(Ui);
