@@ -48,9 +48,35 @@ Start it from your session startup, or just let the first notification start it.
 notify-send "Build finished" "cargo build --release succeeded in 12.4s"
 notify-send -t 0 "Stays until clicked"      # 0 means never expire
 notify-send -u critical "Urgent"            # urgency is accepted and ignored
+
+plush dismiss        # close the notification on top of the stack
+plush dismiss all    # close every notification on screen
+plush --help         # print the usage
+plush --version      # print the version
 ```
 
-Click a panel to dismiss it.
+Click a panel to dismiss it, or use `plush dismiss`. Both announce
+`NotificationClosed` with reason `2`, so a client hears about it either way.
+
+`plush` with no arguments runs the daemon. A typo is an error rather than a second
+daemon: anything other than the commands above prints the usage and exits `2`. The usage
+goes to stdout from `--help`, and to stderr after an error.
+
+`plush dismiss --help` prints the help for that subcommand rather than the top-level usage.
+
+A `--` ends flag parsing, so everything after it is a word rather than a flag. That leaves
+`plush -- dismiss` and `plush dismiss -- all` both working, and it means `plush -- --help`
+is an unknown command rather than a request for help — the usual meaning of the separator.
+Since neither command has an argument that could be mistaken for a flag, `--` is only ever
+needed to be explicit about that.
+
+`--help` and `--version` never touch Wayland or D-Bus, so they work over ssh and in a
+script without a compositor.
+
+The two `dismiss` commands talk to the running daemon over D-Bus, so they do not need to
+be started from the same place. If nothing is running the call fails with a
+`ServiceUnknown` error — unless the D-Bus activation file from the install step is in
+place, in which case the bus starts the daemon first and there is then nothing to dismiss.
 
 ## Behaviour
 
@@ -63,8 +89,9 @@ Click a panel to dismiss it.
 | Expiry | per-notification; `-1` becomes 5000 ms, `0` never expires |
 | Animation | slides in from the right and fades up over 220 ms; the same motion reversed on the way out |
 | `replaces_id` | replaces the content in place and restarts the timeout |
-| Dismiss | pointer press, or `CloseNotification` |
+| Dismiss | pointer press, `CloseNotification`, or `plush dismiss` |
 | Closing reasons | `1` expired, `2` dismissed by user, `3` `CloseNotification` |
+| Control interface | `org.plush.Control` at `/org/plush/Control`, methods `Dismiss` and `DismissAll` |
 | `GetCapabilities` | `["body"]` |
 | `GetServerInformation` | `plush`, `plush`, version, `1.2` |
 
@@ -180,7 +207,7 @@ mutates the queue and pings; the main thread reconciles its panels against the q
 the main thread retires a notification (expiry or click) it pushes a reason back over an
 `async_channel` for the D-Bus thread to emit. Neither thread blocks on the other.
 
-Four consequences worth knowing:
+Five consequences worth knowing:
 
 - **A panel is drawn only from `configure`.** The compositor's suggested size is the single
   source of truth for surface state, so a buffer can never be attached with stale geometry.
@@ -195,6 +222,10 @@ Four consequences worth knowing:
   once the exit has finished.
 - **Configuration is read once, at startup.** It is parsed into a `Config` that the renderer
   then reads as plain values. There is no reload, so editing the file needs a restart.
+- **The CLI is a separate process, not a client of the queue.** `plush dismiss` opens its own
+  connection and calls `org.plush.Control`, so it works from anywhere in the session and needs
+  no socket of its own. The daemon then retires those notifications through exactly the same
+  path a pointer press takes, which is why they animate away rather than vanishing.
 
 Text is shaped with `cosmic-text` and rasterised through `SwashCache` by hand. The glyph
 path deliberately avoids `cosmic_text::Buffer::draw`, which hides the coverage and
@@ -220,6 +251,15 @@ end, because `wl_shm`'s `Argb8888` is BGRA in memory while `tiny-skia` paints RG
   roughly 15 frames to arrive and 12 to leave, and with `enabled = false` three paints in
   2 ms and a quarter of the CPU. Four panels animating at once allocate no extra buffers,
   leak no surfaces, and log no `wl_display` errors.
+- The CLI is exercised end to end against a live daemon: `plush dismiss` closes exactly the
+  top panel and `plush dismiss all` the rest, each announced as reason `2`; the surfaces are
+  painted and destroyed without a `wl_display` error, dismissing a panel mid-animation works,
+  an empty queue is quiet, a typo exits `2` without starting a second daemon, and with no
+  daemon the call reports `ServiceUnknown` rather than panicking.
+- `--help` and `--version` are covered by unit tests asserting they are commands in their own
+  right, that the usage text lists every command, and that they still work when arguments
+  follow them. `--` is covered by tests for both sides of the terminator, including that a
+  `--help` after it is a word rather than the flag.
 
 ## License
 
