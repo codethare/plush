@@ -1,9 +1,12 @@
 # plush configuration.
 #
-# Read from $XDG_CONFIG_HOME/plush/config.toml, which is ~/.config/plush/config.toml
-# unless XDG_CONFIG_HOME has been moved. The file is optional, and every key below is
-# shown at its default, so deleting the file — or any single line in it — changes
-# nothing. A file that is present but wrong is an error, not a silent fallback.
+# This file is the default. It is compiled into the binary and used whenever there is no
+# user configuration at $XDG_CONFIG_HOME/plush/config.toml, which is
+# ~/.config/plush/config.toml unless XDG_CONFIG_HOME has been moved. Copy it there to
+# change anything; the look below is the one plush has always had.
+#
+# Every key is optional and every key below is shown at its default, so deleting a line
+# changes nothing. A file that is present but wrong is an error, not a silent fallback.
 #
 # Colours are #rgb, #rgba, #rrggbb or #rrggbbaa. The alpha channel matters: below ff
 # the panel is translucent over whatever is behind it.

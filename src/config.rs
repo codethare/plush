@@ -1,11 +1,19 @@
 //! User configuration, read from `$XDG_CONFIG_HOME/plush/config.toml`.
 //!
 //! Every key is optional: a missing file, or a missing key inside it, keeps the
-//! built-in default. A file that *is* present but wrong is an error rather than a
+//! bundled default. A file that *is* present but wrong is an error rather than a
 //! silent fallback, so a typo cannot leave the daemon running with a look you did
 //! not ask for. Unknown keys are rejected for the same reason.
+//!
+//! With no user file at all the `data/config.toml` shipped in this repository is
+//! compiled in and used, so that file is the real default rather than a description
+//! of the Rust one. A test holds it to the look plush had before any of it was
+//! configurable.
 
-use std::{env, fs, io, path::PathBuf};
+use std::{
+    env, fs, io,
+    path::{Path, PathBuf},
+};
 
 use cosmic_text::{Family, Metrics, Weight};
 use serde::Deserialize;
@@ -192,15 +200,28 @@ pub fn path() -> PathBuf {
     base.join("plush").join("config.toml")
 }
 
-/// Reads the configuration, falling back to the defaults when there is no file.
+/// The configuration shipped with plush, compiled into the binary.
+///
+/// When there is no user file this is what runs, so `data/config.toml` is the real
+/// default rather than documentation of the Rust one.
+const BUNDLED: &str = include_str!("../data/config.toml");
+
+/// Reads the configuration, falling back to the bundled file when the user has none.
 pub fn load() -> Result<Config, String> {
-    let path = path();
-    let text = match fs::read_to_string(&path) {
+    load_from(&path())
+}
+
+fn load_from(path: &Path) -> Result<Config, String> {
+    let text = match fs::read_to_string(path) {
         Ok(text) => text,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Config::default()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return bundled(),
         Err(err) => return Err(format!("{}: {err}", path.display())),
     };
     toml::from_str(&text).map_err(|err| format!("{}: {err}", path.display()))
+}
+
+fn bundled() -> Result<Config, String> {
+    toml::from_str(BUNDLED).map_err(|err| format!("bundled config.toml is invalid: {err}"))
 }
 
 #[cfg(test)]
@@ -223,12 +244,6 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_file_leaves_the_defaults() {
-        assert_eq!(Config::default().border.width, 1.0);
-        assert_eq!(Config::default().background.color, Rgba(28, 28, 30, 214));
-    }
-
-    #[test]
     fn partial_config_keeps_the_other_defaults() {
         let config: Config = toml::from_str("[border]\nwidth = 3.0\n").unwrap();
         assert_eq!(config.border.width, 3.0);
@@ -236,11 +251,50 @@ mod tests {
         assert_eq!(config.font.title_size, Font::default().title_size);
     }
 
+    /// The bundled file is what runs when there is no user configuration, so it has to
+    /// reproduce exactly the look plush had before any of this was configurable: a 1px
+    /// white hairline, a translucent dark grey panel, and sans-serif at the original
+    /// sizes and weights.
     #[test]
-    fn the_documented_example_parses() {
-        let example = include_str!("../data/config.toml");
-        let config: Config = toml::from_str(example).expect("data/config.toml must stay valid");
-        assert_eq!(config, Config::default(), "the example must document the defaults");
+    fn the_bundled_default_is_the_original_look() {
+        let bundled: Config = toml::from_str(BUNDLED).expect("data/config.toml must parse");
+        assert_eq!(bundled, Config::default(), "a missing key must match the bundled value");
+
+        assert_eq!(bundled.border.width, 1.0);
+        assert_eq!(bundled.border.color, Rgba(255, 255, 255, 26));
+        assert_eq!(bundled.background.color, Rgba(28, 28, 30, 214));
+        assert_eq!(bundled.font.family, "sans-serif");
+        assert_eq!(bundled.font.app_metrics(), Metrics::new(11.0, 15.0));
+        assert_eq!(bundled.font.title_metrics(), Metrics::new(14.0, 19.0));
+        assert_eq!(bundled.font.body_metrics(), Metrics::new(13.0, 18.0));
+        assert_eq!(bundled.font.app_weight, FontWeight(Weight::MEDIUM));
+        assert_eq!(bundled.font.title_weight, FontWeight(Weight::BOLD));
+        assert_eq!(bundled.font.body_weight, FontWeight(Weight::NORMAL));
+    }
+
+    #[test]
+    fn with_no_user_file_the_bundled_default_applies() {
+        let missing = env::temp_dir().join("plush-absent-config").join("config.toml");
+        let config = load_from(&missing).expect("a missing file is not an error");
+        assert_eq!(config, Config::default());
+    }
+
+    #[test]
+    fn a_user_file_wins_over_the_bundled_default() {
+        let dir = env::temp_dir().join("plush-config-test");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+
+        fs::write(&path, "[border]\nwidth = 7.0\n").unwrap();
+        let config = load_from(&path).unwrap();
+        assert_eq!(config.border.width, 7.0);
+        assert_eq!(config.background.color, Rgba(28, 28, 30, 214), "untouched keys stay default");
+
+        fs::write(&path, "[border]\nwidth = \"thick\"\n").unwrap();
+        let err = load_from(&path).unwrap_err();
+        assert!(err.contains(&path.display().to_string()), "the error must name the file: {err}");
+
+        fs::remove_file(&path).unwrap();
     }
 
     #[test]

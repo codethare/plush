@@ -70,9 +70,12 @@ Click a panel to dismiss it.
 ## Configuration
 
 plush reads `$XDG_CONFIG_HOME/plush/config.toml`, which is `~/.config/plush/config.toml`
-unless `XDG_CONFIG_HOME` has been moved. The file is optional, and so is every key in it:
-anything you leave out keeps the default shown below. `data/config.toml` in this repository is
-a copyable example that spells out every key at its default.
+unless `XDG_CONFIG_HOME` has been moved. **There is no need to create it:** with no user file
+plush runs the bundled `data/config.toml`, which is the look it has always had. Copy that file
+across only when you want to change something.
+
+The file is optional, and so is every key in it: anything you leave out keeps the default shown
+below.
 
 ```sh
 mkdir -p ~/.config/plush
@@ -179,8 +182,9 @@ end, because `wl_shm`'s `Argb8888` is BGRA in memory while `tiny-skia` paints RG
 - Panel pixels are covered by unit tests asserting the rounded corners, the opaque
   interior, and that a title never falls back to a second font mid-run.
 - Configuration is covered by unit tests for colour shorthand, partial files, and the
-  rejection of unknown keys, plus a test asserting `data/config.toml` still documents the
-  defaults exactly.
+  rejection of unknown keys, plus tests asserting that a missing file falls back to the
+  bundled `data/config.toml`, that a user file overrides it, and that the bundled values are
+  still the pre-configuration look.
 
 ## License
 
