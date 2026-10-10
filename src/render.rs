@@ -91,7 +91,15 @@ pub fn card_height(font_system: &mut FontSystem, buffer: &mut Buffer) -> u32 {
     ((text + 2.0 * PAD).ceil() as u32).clamp(MIN_H, MAX_H)
 }
 
+/// How far a card travels as it arrives, in logical pixels. A full width, so it
+/// starts just past the right edge rather than fading in on the spot.
+const SLIDE: f32 = PANEL_W as f32;
+
 /// Renders one panel into `canvas`.
+///
+/// `progress` is the card's animation state: 0 is fully off to the right and
+/// invisible, 1 is settled. Cards drawn with animations turned off pass 1.0.
+#[allow(clippy::too_many_arguments)]
 pub fn paint(
     canvas: &mut [u8],
     width: u32,
@@ -100,17 +108,30 @@ pub fn paint(
     font_system: &mut FontSystem,
     swash: &mut SwashCache,
     buffer: &mut Buffer,
+    progress: f32,
 ) {
     let pixels = &mut canvas[..width as usize * height as usize * 4];
-    panel(pixels, width, height, config);
-    text(pixels, width, height, font_system, swash, buffer);
+    let progress = progress.clamp(0.0, 1.0);
+    let slide = SLIDE * (1.0 - progress);
+
+    panel(pixels, width, height, config, slide);
+    text(pixels, width, height, font_system, swash, buffer, slide);
     // wl_shm's Argb8888 is BGRA in memory on little-endian; tiny-skia draws RGBA.
     for pixel in pixels.chunks_exact_mut(4) {
         pixel.swap(0, 2);
     }
+    // The buffer is premultiplied, so fading it means scaling every channel alike.
+    if progress < 1.0 {
+        let alpha = (progress * 255.0) as u32;
+        for pixel in pixels.chunks_exact_mut(4) {
+            for channel in pixel.iter_mut() {
+                *channel = (*channel as u32 * alpha / 255) as u8;
+            }
+        }
+    }
 }
 
-fn panel(pixels: &mut [u8], width: u32, height: u32, config: &Config) {
+fn panel(pixels: &mut [u8], width: u32, height: u32, config: &Config, slide: f32) {
     let Some(mut pixmap) = PixmapMut::from_bytes(pixels, width, height) else {
         return;
     };
@@ -122,7 +143,7 @@ fn panel(pixels: &mut [u8], width: u32, height: u32, config: &Config) {
     fill.set_color_rgba8(background.0, background.1, background.2, background.3);
     fill.anti_alias = true;
     pixmap.fill_path(
-        &rounded_rect(0.0, 0.0, w, h, RADIUS),
+        &rounded_rect(slide, 0.0, w, h, RADIUS),
         &fill,
         FillRule::Winding,
         Transform::identity(),
@@ -143,7 +164,13 @@ fn panel(pixels: &mut [u8], width: u32, height: u32, config: &Config) {
     edge.anti_alias = true;
     let inset = stroke_width / 2.0;
     pixmap.stroke_path(
-        &rounded_rect(inset, inset, w - stroke_width, h - stroke_width, RADIUS - inset),
+        &rounded_rect(
+            slide + inset,
+            inset,
+            w - stroke_width,
+            h - stroke_width,
+            RADIUS - inset,
+        ),
         &edge,
         &Stroke { width: stroke_width, ..Stroke::default() },
         Transform::identity(),
@@ -158,6 +185,7 @@ fn text(
     font_system: &mut FontSystem,
     swash: &mut SwashCache,
     buffer: &mut Buffer,
+    slide: f32,
 ) {
     buffer.shape_until_scroll(font_system, false);
     for run in buffer.layout_runs() {
@@ -165,7 +193,7 @@ fn text(
             let Some(color) = glyph.color_opt else {
                 continue;
             };
-            let origin = glyph.physical((PAD, PAD + run.line_y), 1.0);
+            let origin = glyph.physical((PAD + slide, PAD + run.line_y), 1.0);
             let Some(image) = swash.get_image(font_system, origin.cache_key) else {
                 continue;
             };
@@ -261,7 +289,7 @@ mod tests {
     use super::*;
     use crate::dbus::Notification;
 
-    fn render_with(config: Config, sample: Notification) -> (Vec<u8>, u32, u32) {
+    fn render_with(config: Config, sample: Notification, progress: f32) -> (Vec<u8>, u32, u32) {
         let mut font_system = FontSystem::new();
         let mut buffer = build(&mut font_system, &config, &sample);
         let height = card_height(&mut font_system, &mut buffer);
@@ -275,8 +303,20 @@ mod tests {
             &mut font_system,
             &mut swash,
             &mut buffer,
+            progress,
         );
         (canvas, PANEL_W, height)
+    }
+
+    /// Leftmost column with anything in it, in logical pixels.
+    fn first_inked_column(canvas: &[u8], width: u32, height: u32) -> Option<usize> {
+        let (w, h) = (width as usize, height as usize);
+        (0..w).find(|x| (0..h).any(|y| canvas[(y * w + x) * 4 + 3] > 0))
+    }
+
+    /// Total alpha, as a stand-in for how visible the card is.
+    fn ink(canvas: &[u8]) -> u64 {
+        canvas.chunks_exact(4).map(|pixel| u64::from(pixel[3])).sum()
     }
 
     fn sample() -> Notification {
@@ -291,7 +331,7 @@ mod tests {
 
     #[test]
     fn panel_has_the_expected_shape_and_colours() {
-        let (canvas, width, height) = render_with(Config::default(), sample());
+        let (canvas, width, height) = render_with(Config::default(), sample(), 1.0);
         let (w, h) = (width as usize, height as usize);
 
         let interior = canvas[(h / 2 * w + w / 2) * 4 + 3];
@@ -333,6 +373,44 @@ mod tests {
     }
 
     #[test]
+    fn a_card_at_progress_zero_is_invisible() {
+        let (canvas, ..) = render_with(Config::default(), sample(), 0.0);
+        assert!(
+            canvas.chunks_exact(4).all(|pixel| pixel[3] == 0),
+            "nothing may be visible before the card has arrived"
+        );
+    }
+
+    #[test]
+    fn arriving_slides_in_from_the_right_and_fades_up() {
+        let settled = render_with(Config::default(), sample(), 1.0);
+        let halfway = render_with(Config::default(), sample(), 0.5);
+
+        assert_eq!(first_inked_column(&settled.0, settled.1, settled.2), Some(0));
+
+        let arrived = first_inked_column(&halfway.0, halfway.1, halfway.2).expect("still visible");
+        assert!(
+            (150..200).contains(&arrived),
+            "half a slide in, the card should sit about half a width right; first ink at {arrived}"
+        );
+
+        assert!(
+            ink(&halfway.0) < ink(&settled.0),
+            "a card on its way in is fainter than a settled one"
+        );
+    }
+
+    #[test]
+    fn progress_only_ever_adds_to_a_settled_card() {
+        let settled = render_with(Config::default(), sample(), 1.0);
+        for progress in [0.0, 0.25, 0.5, 0.75] {
+            let frame = render_with(Config::default(), sample(), progress);
+            assert_eq!(frame.1, settled.1, "the canvas size never changes with progress");
+            assert!(ink(&frame.0) <= ink(&settled.0));
+        }
+    }
+
+    #[test]
     fn long_bodies_are_clipped_to_max_height() {
         let mut font_system = FontSystem::new();
         let long = Notification {
@@ -352,7 +430,7 @@ mod tests {
             "[background]\ncolor = \"#ff0000ff\"\n\n[border]\nwidth = 0.0\n",
         )
         .unwrap();
-        let (canvas, width, height) = render_with(plain, sample());
+        let (canvas, width, height) = render_with(plain, sample(), 1.0);
         let (w, h) = (width as usize, height as usize);
 
         let centre = (h / 2 * w + w / 2) * 4;
@@ -366,7 +444,7 @@ mod tests {
             "[background]\ncolor = \"#ff0000ff\"\n\n[border]\nwidth = 3.0\ncolor = \"#ffffffff\"\n",
         )
         .unwrap();
-        let (canvas, width, _) = render_with(bordered, sample());
+        let (canvas, width, _) = render_with(bordered, sample(), 1.0);
         let w = width as usize;
         let near_top = (w + w / 2) * 4;
         assert!(

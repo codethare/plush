@@ -4,9 +4,9 @@
 //! `configure` is the only place a card is drawn, so surface state and buffer
 //! state can never disagree.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use calloop::{LoopHandle, RegistrationToken};
+use calloop::{timer::TimeoutAction, LoopHandle, RegistrationToken};
 use cosmic_text::{Buffer, FontSystem, SwashCache};
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
@@ -34,6 +34,7 @@ use wayland_client::{
 };
 
 use crate::{
+    anim::Anim,
     config::Config,
     dbus::{CloseRequest, Notification, Shared, REASON_DISMISSED, REASON_EXPIRED},
     render,
@@ -43,6 +44,8 @@ use crate::{
 const MARGIN: i32 = 16;
 /// Space between stacked cards.
 const GAP: i32 = 10;
+/// One animation frame. 60 Hz, which is what the motion was tuned against.
+const FRAME: Duration = Duration::from_millis(16);
 
 struct Card {
     id: u32,
@@ -51,7 +54,18 @@ struct Card {
     surface: LayerSurface,
     content: Buffer,
     height: u32,
+    /// The size the compositor last configured. Animation redraws need it, which is
+    /// why a card cannot be painted before its first `configure`.
+    size: Option<(u32, u32)>,
     deadline: Option<Instant>,
+    anim: Anim,
+}
+
+impl Card {
+    /// An exit that has run its course; the surface is dropped once this is true.
+    fn leaving_done(&self, now: Instant) -> bool {
+        self.anim.leaving() && self.anim.finished(now)
+    }
 }
 
 fn source_of(notification: &Notification) -> (String, String, String) {
@@ -80,6 +94,8 @@ pub struct Ui {
     cards: Vec<Card>,
     pointer: Option<wl_pointer::WlPointer>,
     expiry: Option<RegistrationToken>,
+    /// The frame timer, alive only while something is moving.
+    frame: Option<RegistrationToken>,
 }
 
 impl Ui {
@@ -114,6 +130,7 @@ impl Ui {
             cards: Vec::new(),
             pointer: None,
             expiry: None,
+            frame: None,
         }
     }
 
@@ -149,16 +166,36 @@ impl Ui {
                 }
             }
         }
+        // Cards the queue no longer holds are on their way out: with animations on
+        // they keep their surface and slide away, otherwise the surface is dropped
+        // here and now. Either way they leave the stack, so the rest close up.
+        let now = Instant::now();
+        for mut card in std::mem::take(&mut self.cards) {
+            match card.anim {
+                Anim::Leaving(_) if !card.leaving_done(now) => ordered.push(card),
+                Anim::Leaving(_) => {}
+                _ if self.config.animation.enabled => {
+                    card.anim.leave();
+                    ordered.push(card);
+                }
+                _ => {}
+            }
+        }
         self.cards = ordered;
 
         let mut offset = MARGIN;
         for card in &mut self.cards {
+            // A departing card keeps the place it left from while it fades away.
+            if card.anim.leaving() {
+                continue;
+            }
             card.surface.set_margin(offset, 0, 0, MARGIN);
             card.surface.commit();
             offset += card.height as i32 + GAP;
         }
 
         self.rearm();
+        self.arm_frames();
     }
 
     fn make_card(&mut self, notification: &Notification) -> Card {
@@ -188,6 +225,12 @@ impl Ui {
             content,
             height,
             deadline: notification.timeout.map(|timeout| Instant::now() + timeout),
+            anim: if self.config.animation.enabled {
+                Anim::entering()
+            } else {
+                Anim::Settled
+            },
+            size: None,
         }
     }
 
@@ -206,6 +249,10 @@ impl Ui {
             .map(|card| card.id)
             .collect();
         if expired.is_empty() {
+            // The card this timer was set for has already gone — a departing one is
+            // dropped once its exit finishes. The next deadline still needs a timer,
+            // and this one has just removed itself, so arm a fresh one.
+            self.rearm();
             return;
         }
         self.store
@@ -234,10 +281,107 @@ impl Ui {
         self.expiry = self
             .handle
             .insert_source(timer, |_, _, ui: &mut Ui| {
+                // The source removes itself on `Drop`, and `LoopHandle::remove` does not
+                // check that a token still names the same source. Keeping the token would
+                // let the next `rearm` delete whatever source has since reused the slot.
+                ui.expiry = None;
                 ui.expire();
-                calloop::timer::TimeoutAction::Drop
+                TimeoutAction::Drop
             })
             .ok();
+    }
+
+    /// Paints a card where its animation currently has it, and reports whether the
+    /// frame reached the compositor.
+    ///
+    /// Called from `configure`, which is the only source of the size, and from the
+    /// frame timer while the card is moving. A `false` means the frame was dropped —
+    /// every buffer in the pool can be in flight at once — which the caller has to
+    /// retry rather than treat as a finished animation.
+    fn draw(&mut self, index: usize) -> bool {
+        let Some((width, height)) = self.cards[index].size else {
+            return false;
+        };
+        let stride = width as i32 * 4;
+        let Ok((buffer, canvas)) = self.pool.create_buffer(
+            width as i32,
+            height as i32,
+            stride,
+            wl_shm::Format::Argb8888,
+        ) else {
+            return false;
+        };
+
+        let card = &mut self.cards[index];
+        render::paint(
+            canvas,
+            width,
+            height,
+            &self.config,
+            &mut self.font_system,
+            &mut self.swash,
+            &mut card.content,
+            card.anim.progress(Instant::now()),
+        );
+
+        card.surface.wl_surface().damage_buffer(0, 0, width as i32, height as i32);
+        if buffer.attach_to(card.surface.wl_surface()).is_err() {
+            return false;
+        }
+        card.surface.commit();
+        true
+    }
+
+    /// Keeps one frame timer alive while any card is moving.
+    fn arm_frames(&mut self) {
+        if self.frame.is_some() || !self.cards.iter().any(|card| card.anim.running()) {
+            return;
+        }
+        let timer = calloop::timer::Timer::from_duration(FRAME);
+        self.frame = self.handle.insert_source(timer, |_, _, ui: &mut Ui| ui.frames()).ok();
+    }
+
+    /// One animation frame: repaint what is moving, settle what has arrived, and
+    /// drop the surfaces of what has finished leaving.
+    fn frames(&mut self) -> TimeoutAction {
+        let now = Instant::now();
+        let mut busy = false;
+
+        for index in 0..self.cards.len() {
+            match self.cards[index].anim {
+                Anim::Settled => {}
+                Anim::Entering(_) => {
+                    // Park only once the resting frame is really on screen. A dropped
+                    // frame would otherwise leave the card stuck part-way faded.
+                    let painted = self.draw(index);
+                    if painted && self.cards[index].anim.finished(now) {
+                        self.cards[index].anim = Anim::Settled;
+                    } else {
+                        busy = true;
+                    }
+                }
+                Anim::Leaving(_) => {
+                    // Nothing to paint once it has gone; `retain` below drops it.
+                    if !self.cards[index].anim.finished(now) {
+                        self.draw(index);
+                        busy = true;
+                    }
+                }
+            }
+        }
+
+        // A departing card that has faded out is dropped here, surface and all. It was
+        // already out of the stack, so nothing below it needs re-laying out.
+        self.cards.retain(|card| !card.leaving_done(now));
+
+        if busy {
+            TimeoutAction::ToDuration(FRAME)
+        } else {
+            // The source removes itself here, so the token goes with it rather than
+            // being left to name a slot some later source will reuse.
+            self.frame = None;
+            TimeoutAction::Drop
+        }
     }
 }
 
@@ -337,34 +481,12 @@ impl LayerShellHandler for Ui {
         if width == 0 || height == 0 {
             return;
         }
-        let Some(card) = self.cards.iter_mut().find(|card| &card.surface == layer) else {
+        let Some(index) = self.cards.iter().position(|card| &card.surface == layer) else {
             return;
         };
 
-        let stride = width as i32 * 4;
-        let Ok((buffer, canvas)) = self.pool.create_buffer(
-            width as i32,
-            height as i32,
-            stride,
-            wl_shm::Format::Argb8888,
-        ) else {
-            return;
-        };
-
-        render::paint(
-            canvas,
-            width,
-            height,
-            &self.config,
-            &mut self.font_system,
-            &mut self.swash,
-            &mut card.content,
-        );
-
-        card.surface.wl_surface().damage_buffer(0, 0, width as i32, height as i32);
-        if buffer.attach_to(card.surface.wl_surface()).is_ok() {
-            card.surface.commit();
-        }
+        self.cards[index].size = Some((width, height));
+        self.draw(index);
     }
 }
 

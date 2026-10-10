@@ -21,6 +21,11 @@ color = "#ffffff1a"
 # Dark "system" grey, translucent.
 color = "#1c1c1ed6"
 
+[animation]
+# Slide and fade each panel in from the right, and back out when it goes away.
+# Off makes panels appear and vanish instantly.
+enabled = true
+
 [font]
 # Any installed family name, or the generic sans-serif, serif, monospace, cursive, fantasy.
 family = "sans-serif"

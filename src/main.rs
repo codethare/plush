@@ -1,3 +1,4 @@
+mod anim;
 mod config;
 mod dbus;
 mod render;

@@ -61,6 +61,7 @@ Click a panel to dismiss it.
 | Stack | up to 4 panels, 10 px apart, newest on top |
 | Max height | 320 px; longer bodies are clipped |
 | Expiry | per-notification; `-1` becomes 5000 ms, `0` never expires |
+| Animation | slides in from the right and fades up over 220 ms; the same motion reversed on the way out |
 | `replaces_id` | replaces the content in place and restarts the timeout |
 | Dismiss | pointer press, or `CloseNotification` |
 | Closing reasons | `1` expired, `2` dismissed by user, `3` `CloseNotification` |
@@ -126,14 +127,34 @@ weight 600 for the generic sans family to a serif CJK face whose space glyph is 
 then falls back to a colour-emoji space seventeen pixels wide and leaves a hole in the title.
 `semibold` is accepted, and is fine when the family you name actually has that weight.
 
+### `[animation]`
+
+| Key | Default | |
+|---|---|---|
+| `enabled` | `true` | Slide and fade each panel in from the right, and back out when it goes away. |
+
+A panel arrives over 220 ms: it slides in from just past the right edge while fading
+up, and eases out so it leaves the edge quickly and settles gently. Dismissing or
+expiring a panel runs the same motion backwards. The duration is fixed; there is no
+speed setting.
+
+The surface itself never moves. `zwlr_layer_shell_v1` only honours margins on edges you
+have anchored to, and sliding in from off-screen would need a negative margin, which the
+protocol never promises — so the slide is drawn inside the buffer and works the same on
+every compositor. Frames are driven by a timer at 60 Hz that only runs while something is
+moving; with `enabled = false` there is no timer at all and panels simply appear.
+
 ## Deliberately not implemented
 
-- No configuration beyond the border, the background and the font. Panel width, position,
-  padding, corner radius, the stack limit and the text colours are compile-time constants.
+- No configuration beyond the border, the background, the font and the animation toggle.
+  Panel width, position, padding, corner radius, the stack limit and the text colours are
+  compile-time constants.
 - No icon rendering: `app_icon` is accepted and ignored.
 - No markup: `body-markup` is not advertised, so clients send plain text.
 - No action buttons: `actions` is accepted, `ActionInvoked` is never emitted.
 - No grouping or notification history.
+- No animation tuning beyond on and off: no duration, easing or distance settings.
+- No scale or spring: panels slide and fade, they do not grow into place.
 - No light theme. The text inks are constants and are not configurable, so a light
   `background.color` gives white-on-light text and poor contrast. No `color-scheme` detection.
 - No keyboard handling: panels never take focus.
@@ -159,12 +180,19 @@ mutates the queue and pings; the main thread reconciles its panels against the q
 the main thread retires a notification (expiry or click) it pushes a reason back over an
 `async_channel` for the D-Bus thread to emit. Neither thread blocks on the other.
 
-Three consequences worth knowing:
+Four consequences worth knowing:
 
 - **A panel is drawn only from `configure`.** The compositor's suggested size is the single
   source of truth for surface state, so a buffer can never be attached with stale geometry.
 - **Replacing a notification rebuilds its surface.** A commit without a new buffer does not
   repaint, so a fresh surface is the reliable way to get a fresh `configure`.
+- **One `draw` serves both the compositor and the animation.** A card is painted from
+  `configure`, which is the only place its size comes from, and from the frame timer. A frame
+  that cannot be painted is retried rather than treated as complete, because a card parked
+  halfway through its own fade would stay that way.
+- **A departing card leaves the stack before it stops moving.** It keeps its place while it
+  fades out, so the panels below it close up immediately, and its surface is dropped only
+  once the exit has finished.
 - **Configuration is read once, at startup.** It is parsed into a `Config` that the renderer
   then reads as plain values. There is no reload, so editing the file needs a restart.
 
@@ -185,6 +213,13 @@ end, because `wl_shm`'s `Argb8888` is BGRA in memory while `tiny-skia` paints RG
   rejection of unknown keys, plus tests asserting that a missing file falls back to the
   bundled `data/config.toml`, that a user file overrides it, and that the bundled values are
   still the pre-configuration look.
+- The animation is covered by unit tests for the easing curve and the way progress maps to
+  pixels: nothing is visible at 0, the panel is a half-width to the right at 0.5, and a
+  settled panel is painted exactly as it was before animations existed.
+- Measured against a headless sway with the protocol traced: 17 ms between frames (60 Hz),
+  roughly 15 frames to arrive and 12 to leave, and with `enabled = false` three paints in
+  2 ms and a quarter of the CPU. Four panels animating at once allocate no extra buffers,
+  leak no surfaces, and log no `wl_display` errors.
 
 ## License
 

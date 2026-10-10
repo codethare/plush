@@ -181,12 +181,27 @@ impl Font {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct Animation {
+    /// Slide and fade each panel in from the right, and back out when it goes away.
+    /// Off makes panels appear and vanish instantly.
+    pub enabled: bool,
+}
+
+impl Default for Animation {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub border: Border,
     pub background: Background,
     pub font: Font,
+    pub animation: Animation,
 }
 
 /// Where the configuration is looked for.
@@ -270,6 +285,14 @@ mod tests {
         assert_eq!(bundled.font.app_weight, FontWeight(Weight::MEDIUM));
         assert_eq!(bundled.font.title_weight, FontWeight(Weight::BOLD));
         assert_eq!(bundled.font.body_weight, FontWeight(Weight::NORMAL));
+        assert!(bundled.animation.enabled, "animation is on out of the box");
+    }
+
+    #[test]
+    fn animations_can_be_turned_off() {
+        let config: Config = toml::from_str("[animation]\nenabled = false\n").unwrap();
+        assert!(!config.animation.enabled);
+        assert_eq!(config.border, Border::default(), "and nothing else moves");
     }
 
     #[test]
@@ -307,5 +330,8 @@ mod tests {
 
         let bad_weight: Result<Config, _> = toml::from_str("[font]\ntitle-weight = \"heavyish\"\n");
         assert!(bad_weight.is_err());
+
+        let bad_animation: Result<Config, _> = toml::from_str("[animation]\nspeed = \"fast\"\n");
+        assert!(bad_animation.is_err(), "only `enabled` is available");
     }
 }
