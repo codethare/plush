@@ -82,12 +82,12 @@ place, in which case the bus starts the daemon first and there is then nothing t
 
 | | |
 |---|---|
-| Anchor | top-right, 16 px from the edge |
+| Position | `top-right` by default; 16 px from the edges it is anchored to |
 | Panel | 380 px wide, 14 px corner radius, 16 px padding |
 | Stack | up to 4 panels, 10 px apart, newest on top |
 | Max height | 320 px; longer bodies are clipped |
 | Expiry | per-notification; `-1` becomes 5000 ms, `0` never expires |
-| Animation | slides in from the right and fades up over 220 ms; the same motion reversed on the way out |
+| Animation | slides in from the nearest edge and fades up over 220 ms; the same motion reversed on the way out |
 | `replaces_id` | replaces the content in place and restarts the timeout |
 | Dismiss | pointer press, `CloseNotification`, or `plush dismiss` |
 | Closing reasons | `1` expired, `2` dismissed by user, `3` `CloseNotification` |
@@ -117,6 +117,25 @@ you staring at a panel that quietly ignored your setting.
 Colours are `#rgb`, `#rgba`, `#rrggbb` or `#rrggbbaa`. The shorthand repeats each digit, so
 `#abc` is `#aabbcc`. The alpha channel is meaningful: below `ff` the panel is translucent over
 whatever is behind it.
+
+### `[panel]`
+
+| Key | Default | |
+|---|---|---|
+| `position` | `"top-right"` | `top-left`, `bottom-left`, `top-center`, `bottom-center`, `top-right` or `bottom-right`. |
+
+The stack is measured from the edges the position names, 16 px in, and grows away from them:
+a top position stacks downwards and a bottom one upwards. The centred columns are anchored
+to no side at all, which is what makes the compositor centre them horizontally.
+
+A panel arrives from the edge its position is nearest, so the direction follows the corner:
+
+| Position | Arrives from | Motion |
+|---|---|---|
+| `top-left`, `bottom-left` | the left edge | slides right |
+| `top-right`, `bottom-right` | the right edge | slides left |
+| `top-center` | above | drops down |
+| `bottom-center` | below | rises up |
 
 ### `[border]`
 
@@ -158,12 +177,12 @@ then falls back to a colour-emoji space seventeen pixels wide and leaves a hole 
 
 | Key | Default | |
 |---|---|---|
-| `enabled` | `true` | Slide and fade each panel in from the right, and back out when it goes away. |
+| `enabled` | `true` | Slide and fade each panel in from the nearest edge, and back out when it goes away. |
 
-A panel arrives over 220 ms: it slides in from just past the right edge while fading
-up, and eases out so it leaves the edge quickly and settles gently. Dismissing or
-expiring a panel runs the same motion backwards. The duration is fixed; there is no
-speed setting.
+A panel arrives over 220 ms: it slides in from just past the nearest edge while fading
+up, and eases out so it leaves the edge quickly and settles gently. Which edge that is
+follows `[panel] position`. Dismissing or expiring a panel runs the same motion
+backwards. The duration is fixed; there is no speed setting.
 
 The surface itself never moves. `zwlr_layer_shell_v1` only honours margins on edges you
 have anchored to, and sliding in from off-screen would need a negative margin, which the
@@ -173,9 +192,9 @@ moving; with `enabled = false` there is no timer at all and panels simply appear
 
 ## Deliberately not implemented
 
-- No configuration beyond the border, the background, the font and the animation toggle.
-  Panel width, position, padding, corner radius, the stack limit and the text colours are
-  compile-time constants.
+- No configuration beyond the position, the border, the background, the font and the
+  animation toggle. Panel width, padding, corner radius, the stack limit and the text
+  colours are compile-time constants.
 - No icon rendering: `app_icon` is accepted and ignored.
 - No markup: `body-markup` is not advertised, so clients send plain text.
 - No action buttons: `actions` is accepted, `ActionInvoked` is never emitted.

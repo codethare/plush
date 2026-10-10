@@ -181,11 +181,92 @@ impl Font {
     }
 }
 
+/// Which corner or edge the stack of panels sits against.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum Position {
+    TopLeft,
+    BottomLeft,
+    TopCenter,
+    BottomCenter,
+    TopRight,
+    BottomRight,
+}
+
+/// Which column of the screen a position is in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Column {
+    Left,
+    Centre,
+    Right,
+}
+
+/// Which row of the screen a position is in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Row {
+    Top,
+    Bottom,
+}
+
+/// The screen edge a panel arrives from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Edge {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+impl Position {
+    pub fn column(self) -> Column {
+        match self {
+            Self::TopLeft | Self::BottomLeft => Column::Left,
+            Self::TopCenter | Self::BottomCenter => Column::Centre,
+            Self::TopRight | Self::BottomRight => Column::Right,
+        }
+    }
+
+    pub fn row(self) -> Row {
+        match self {
+            Self::TopLeft | Self::TopCenter | Self::TopRight => Row::Top,
+            Self::BottomLeft | Self::BottomCenter | Self::BottomRight => Row::Bottom,
+        }
+    }
+
+    /// A panel arrives from the nearest edge. The centred columns have no side to come
+    /// from, so they arrive from their own row instead: top-centre drops in from above,
+    /// bottom-centre rises from below.
+    pub fn edge(self) -> Edge {
+        match self.column() {
+            Column::Left => Edge::Left,
+            Column::Right => Edge::Right,
+            Column::Centre => match self.row() {
+                Row::Top => Edge::Top,
+                Row::Bottom => Edge::Bottom,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct Panel {
+    /// `top-left`, `bottom-left`, `top-center`, `bottom-center`, `top-right` or
+    /// `bottom-right`.
+    pub position: Position,
+}
+
+impl Default for Panel {
+    fn default() -> Self {
+        Self { position: Position::TopRight }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Animation {
-    /// Slide and fade each panel in from the right, and back out when it goes away.
-    /// Off makes panels appear and vanish instantly.
+    /// Slide and fade each panel in from the nearest edge, and back out when it goes
+    /// away. Off makes panels appear and vanish instantly.
     pub enabled: bool,
 }
 
@@ -198,6 +279,7 @@ impl Default for Animation {
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
+    pub panel: Panel,
     pub border: Border,
     pub background: Background,
     pub font: Font,
@@ -286,6 +368,41 @@ mod tests {
         assert_eq!(bundled.font.title_weight, FontWeight(Weight::BOLD));
         assert_eq!(bundled.font.body_weight, FontWeight(Weight::NORMAL));
         assert!(bundled.animation.enabled, "animation is on out of the box");
+        assert_eq!(bundled.panel.position, Position::TopRight, "the original corner");
+    }
+
+    #[test]
+    fn the_position_defaults_to_the_top_right() {
+        assert_eq!(Config::default().panel.position, Position::TopRight);
+        assert_eq!(Config::default().panel.position.edge(), Edge::Right);
+    }
+
+    /// Every position parses, and each one arrives from the edge next to it.
+    #[test]
+    fn every_position_parses_and_arrives_from_its_edge() {
+        let cases = [
+            ("top-left", Column::Left, Row::Top, Edge::Left),
+            ("bottom-left", Column::Left, Row::Bottom, Edge::Left),
+            ("top-center", Column::Centre, Row::Top, Edge::Top),
+            ("bottom-center", Column::Centre, Row::Bottom, Edge::Bottom),
+            ("top-right", Column::Right, Row::Top, Edge::Right),
+            ("bottom-right", Column::Right, Row::Bottom, Edge::Right),
+        ];
+        for (name, column, row, edge) in cases {
+            let config: Config =
+                toml::from_str(&format!("[panel]\nposition = {name:?}\n")).expect(name);
+            let position = config.panel.position;
+            assert_eq!(position.column(), column, "{name} column");
+            assert_eq!(position.row(), row, "{name} row");
+            assert_eq!(position.edge(), edge, "{name} edge");
+        }
+    }
+
+    #[test]
+    fn an_unknown_position_is_rejected() {
+        let bad: Result<Config, _> = toml::from_str("[panel]\nposition = \"middle\"\n");
+        let message = bad.expect_err("middle is not a position").to_string();
+        assert!(message.contains("top-left"), "the error should list the choices: {message}");
     }
 
     #[test]

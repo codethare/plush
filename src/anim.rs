@@ -1,15 +1,15 @@
 //! Entrance and exit motion for a card.
 //!
-//! A card arrives by sliding in from the right edge while fading up, and leaves by
-//! running the same motion backwards. Both are expressed as one `progress` in
-//! `0..=1`, which is all the renderer needs: 0 is fully off to the right and
-//! invisible, 1 is settled.
+//! A card arrives by sliding in from the nearest screen edge while fading up, and leaves
+//! by running the same motion backwards. Both are expressed as one `progress` in
+//! `0..=1`, which is all the renderer needs: 0 is a full side off screen and invisible,
+//! 1 is settled.
 //!
-//! The surface itself never moves. `Anchor::TOP | Anchor::RIGHT` only honours the top
-//! and right margins — the protocol says a margin on an edge you are not anchored to
-//! has no effect — and sliding in from off-screen would need a negative margin, which
-//! the protocol never promises. So the slide is drawn inside the buffer, which works
-//! the same on every compositor.
+//! Which edge that is comes from the configured position, and the motion lives here
+//! rather than in the surface because the surface itself never moves. The compositor only
+//! honours margins on the edges you are anchored to, and starting off-screen would need a
+//! negative margin, which the protocol never promises. So the slide is drawn inside the
+//! buffer, which works the same on every compositor.
 
 use std::time::{Duration, Instant};
 

@@ -11,6 +11,12 @@
 # Colours are #rgb, #rgba, #rrggbb or #rrggbbaa. The alpha channel matters: below ff
 # the panel is translucent over whatever is behind it.
 
+[panel]
+# Where the stack sits: top-left, bottom-left, top-center, bottom-center, top-right or
+# bottom-right. A panel arrives from the edge its position is nearest, so the sides slide
+# in sideways and the centred ones drop in from above or rise from below.
+position = "top-right"
+
 [border]
 # Stroke width in logical pixels. 0 draws no border.
 width = 1.0

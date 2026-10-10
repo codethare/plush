@@ -7,7 +7,10 @@
 use cosmic_text::{Attrs, Buffer, FontSystem, Shaping, SwashCache, SwashContent, SwashImage};
 use tiny_skia::{Color, FillRule, Paint, Path, PathBuilder, PixmapMut, Stroke, Transform};
 
-use crate::{config::Config, dbus::Notification};
+use crate::{
+    config::{Config, Edge},
+    dbus::Notification,
+};
 
 /// Panel width in logical pixels.
 pub const PANEL_W: u32 = 380;
@@ -91,14 +94,12 @@ pub fn card_height(font_system: &mut FontSystem, buffer: &mut Buffer) -> u32 {
     ((text + 2.0 * PAD).ceil() as u32).clamp(MIN_H, MAX_H)
 }
 
-/// How far a card travels as it arrives, in logical pixels. A full width, so it
-/// starts just past the right edge rather than fading in on the spot.
-const SLIDE: f32 = PANEL_W as f32;
-
 /// Renders one panel into `canvas`.
 ///
-/// `progress` is the card's animation state: 0 is fully off to the right and
-/// invisible, 1 is settled. Cards drawn with animations turned off pass 1.0.
+/// `progress` is the card's animation state: 0 is a full side off screen and invisible,
+/// 1 is settled. Which side is the configured position, so a panel on the left slides
+/// right, one on the right slides left, and the centred ones drop in or rise. Cards
+/// drawn with animations turned off pass 1.0.
 #[allow(clippy::too_many_arguments)]
 pub fn paint(
     canvas: &mut [u8],
@@ -112,10 +113,23 @@ pub fn paint(
 ) {
     let pixels = &mut canvas[..width as usize * height as usize * 4];
     let progress = progress.clamp(0.0, 1.0);
-    let slide = SLIDE * (1.0 - progress);
 
-    panel(pixels, width, height, config, slide);
-    text(pixels, width, height, font_system, swash, buffer, slide);
+    // A panel travels its own side, so at progress 0 it sits entirely outside the buffer.
+    let edge = config.panel.position.edge();
+    let travel = (1.0 - progress)
+        * match edge {
+            Edge::Left | Edge::Right => width as f32,
+            Edge::Top | Edge::Bottom => height as f32,
+        };
+    let (dx, dy) = match edge {
+        Edge::Left => (-travel, 0.0),
+        Edge::Right => (travel, 0.0),
+        Edge::Top => (0.0, -travel),
+        Edge::Bottom => (0.0, travel),
+    };
+
+    panel(pixels, width, height, config, dx, dy);
+    text(pixels, width, height, font_system, swash, buffer, dx, dy);
     // wl_shm's Argb8888 is BGRA in memory on little-endian; tiny-skia draws RGBA.
     for pixel in pixels.chunks_exact_mut(4) {
         pixel.swap(0, 2);
@@ -131,7 +145,7 @@ pub fn paint(
     }
 }
 
-fn panel(pixels: &mut [u8], width: u32, height: u32, config: &Config, slide: f32) {
+fn panel(pixels: &mut [u8], width: u32, height: u32, config: &Config, dx: f32, dy: f32) {
     let Some(mut pixmap) = PixmapMut::from_bytes(pixels, width, height) else {
         return;
     };
@@ -143,7 +157,7 @@ fn panel(pixels: &mut [u8], width: u32, height: u32, config: &Config, slide: f32
     fill.set_color_rgba8(background.0, background.1, background.2, background.3);
     fill.anti_alias = true;
     pixmap.fill_path(
-        &rounded_rect(slide, 0.0, w, h, RADIUS),
+        &rounded_rect(dx, dy, w, h, RADIUS),
         &fill,
         FillRule::Winding,
         Transform::identity(),
@@ -165,8 +179,8 @@ fn panel(pixels: &mut [u8], width: u32, height: u32, config: &Config, slide: f32
     let inset = stroke_width / 2.0;
     pixmap.stroke_path(
         &rounded_rect(
-            slide + inset,
-            inset,
+            dx + inset,
+            dy + inset,
             w - stroke_width,
             h - stroke_width,
             RADIUS - inset,
@@ -178,6 +192,7 @@ fn panel(pixels: &mut [u8], width: u32, height: u32, config: &Config, slide: f32
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn text(
     pixels: &mut [u8],
     width: u32,
@@ -185,7 +200,8 @@ fn text(
     font_system: &mut FontSystem,
     swash: &mut SwashCache,
     buffer: &mut Buffer,
-    slide: f32,
+    dx: f32,
+    dy: f32,
 ) {
     buffer.shape_until_scroll(font_system, false);
     for run in buffer.layout_runs() {
@@ -193,7 +209,7 @@ fn text(
             let Some(color) = glyph.color_opt else {
                 continue;
             };
-            let origin = glyph.physical((PAD + slide, PAD + run.line_y), 1.0);
+            let origin = glyph.physical((PAD + dx, PAD + dy + run.line_y), 1.0);
             let Some(image) = swash.get_image(font_system, origin.cache_key) else {
                 continue;
             };
@@ -309,9 +325,19 @@ mod tests {
     }
 
     /// Leftmost column with anything in it, in logical pixels.
-    fn first_inked_column(canvas: &[u8], width: u32, height: u32) -> Option<usize> {
+    /// Bounding box of everything painted, as (left, right, top, bottom).
+    fn inked_box(canvas: &[u8], width: u32, height: u32) -> Option<(usize, usize, usize, usize)> {
         let (w, h) = (width as usize, height as usize);
-        (0..w).find(|x| (0..h).any(|y| canvas[(y * w + x) * 4 + 3] > 0))
+        let mut found: Option<(usize, usize, usize, usize)> = None;
+        for y in 0..h {
+            for x in 0..w {
+                if canvas[(y * w + x) * 4 + 3] > 0 {
+                    let (left, right, top, bottom) = found.unwrap_or((usize::MAX, 0, usize::MAX, 0));
+                    found = Some((left.min(x), right.max(x), top.min(y), bottom.max(y)));
+                }
+            }
+        }
+        found
     }
 
     /// Total alpha, as a stand-in for how visible the card is.
@@ -386,18 +412,85 @@ mod tests {
         let settled = render_with(Config::default(), sample(), 1.0);
         let halfway = render_with(Config::default(), sample(), 0.5);
 
-        assert_eq!(first_inked_column(&settled.0, settled.1, settled.2), Some(0));
-
-        let arrived = first_inked_column(&halfway.0, halfway.1, halfway.2).expect("still visible");
-        assert!(
-            (150..200).contains(&arrived),
-            "half a slide in, the card should sit about half a width right; first ink at {arrived}"
+        let (last_col, last_row) = (settled.1 as usize - 1, settled.2 as usize - 1);
+        assert_eq!(
+            inked_box(&settled.0, settled.1, settled.2),
+            Some((0, last_col, 0, last_row)),
+            "a settled panel fills its buffer"
         );
+
+        let (left, right, ..) = inked_box(&halfway.0, halfway.1, halfway.2).expect("still visible");
+        assert!(
+            (150..200).contains(&left),
+            "half a slide in, the panel should sit about half a width right; left ink at {left}"
+        );
+        assert_eq!(right, last_col, "and still be clipped against the right edge");
 
         assert!(
             ink(&halfway.0) < ink(&settled.0),
             "a card on its way in is fainter than a settled one"
         );
+    }
+
+    /// Each position arrives from the edge it is anchored to, so halfway through the
+    /// panel is still against that edge and clear of the opposite one.
+    #[test]
+    fn a_panel_arrives_from_the_edge_its_position_names() {
+        let cases = [
+            ("top-left", Edge::Left),
+            ("bottom-left", Edge::Left),
+            ("top-center", Edge::Top),
+            ("bottom-center", Edge::Bottom),
+            ("top-right", Edge::Right),
+            ("bottom-right", Edge::Right),
+        ];
+        for (name, edge) in cases {
+            let config: Config =
+                toml::from_str(&format!("[panel]\nposition = {name:?}\n")).expect(name);
+            let (canvas, width, height) = render_with(config, sample(), 0.5);
+            let (left, right, top, bottom) =
+                inked_box(&canvas, width, height).unwrap_or_else(|| panic!("{name}: nothing painted"));
+            let (last_col, last_row) = (width as usize - 1, height as usize - 1);
+
+            match edge {
+                Edge::Left => {
+                    assert_eq!(left, 0, "{name} must still reach the left edge");
+                    assert!(right < last_col, "{name} must be clipped on the right");
+                }
+                Edge::Right => {
+                    assert_eq!(right, last_col, "{name} must still reach the right edge");
+                    assert!(left > 0, "{name} must be clipped on the left");
+                }
+                Edge::Top => {
+                    assert_eq!(top, 0, "{name} must still reach the top edge");
+                    assert!(bottom < last_row, "{name} must be clipped at the bottom");
+                }
+                Edge::Bottom => {
+                    assert_eq!(bottom, last_row, "{name} must still reach the bottom edge");
+                    assert!(top > 0, "{name} must be clipped at the top");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn no_position_is_visible_before_it_arrives() {
+        for name in [
+            "top-left",
+            "bottom-left",
+            "top-center",
+            "bottom-center",
+            "top-right",
+            "bottom-right",
+        ] {
+            let config: Config =
+                toml::from_str(&format!("[panel]\nposition = {name:?}\n")).expect(name);
+            let (canvas, ..) = render_with(config, sample(), 0.0);
+            assert!(
+                canvas.chunks_exact(4).all(|pixel| pixel[3] == 0),
+                "{name} is showing something before it has arrived"
+            );
+        }
     }
 
     #[test]

@@ -35,7 +35,7 @@ use wayland_client::{
 
 use crate::{
     anim::Anim,
-    config::Config,
+    config::{Column, Config, Position, Row},
     dbus::{CloseRequest, Notification, Shared, REASON_DISMISSED, REASON_EXPIRED},
     render,
 };
@@ -46,6 +46,40 @@ const MARGIN: i32 = 16;
 const GAP: i32 = 10;
 /// One animation frame. 60 Hz, which is what the motion was tuned against.
 const FRAME: Duration = Duration::from_millis(16);
+
+/// Where the stack is anchored. The centred columns leave both sides free, which is
+/// what makes the compositor centre the surface horizontally.
+fn anchor(position: Position) -> Anchor {
+    let vertical = match position.row() {
+        Row::Top => Anchor::TOP,
+        Row::Bottom => Anchor::BOTTOM,
+    };
+    vertical
+        | match position.column() {
+            Column::Left => Anchor::LEFT,
+            Column::Centre => Anchor::empty(),
+            Column::Right => Anchor::RIGHT,
+        }
+}
+
+/// Margins for a card `offset` pixels into the stack, in the order `set_margin` wants
+/// them: top, right, bottom, left.
+///
+/// Only anchored edges take a margin, so a centred column has none on either side. The
+/// stack is measured from the anchored edge, which is why a bottom position stacks
+/// upwards from the bottom of the screen.
+fn margins(position: Position, offset: i32) -> (i32, i32, i32, i32) {
+    let (left, right) = match position.column() {
+        Column::Left => (MARGIN, 0),
+        Column::Centre => (0, 0),
+        Column::Right => (0, MARGIN),
+    };
+    let (top, bottom) = match position.row() {
+        Row::Top => (MARGIN + offset, 0),
+        Row::Bottom => (0, MARGIN + offset),
+    };
+    (top, right, bottom, left)
+}
 
 struct Card {
     id: u32,
@@ -183,13 +217,15 @@ impl Ui {
         }
         self.cards = ordered;
 
-        let mut offset = MARGIN;
+        let position = self.config.panel.position;
+        let mut offset = 0;
         for card in &mut self.cards {
             // A departing card keeps the place it left from while it fades away.
             if card.anim.leaving() {
                 continue;
             }
-            card.surface.set_margin(offset, 0, 0, MARGIN);
+            let (top, right, bottom, left) = margins(position, offset);
+            card.surface.set_margin(top, right, bottom, left);
             card.surface.commit();
             offset += card.height as i32 + GAP;
         }
@@ -210,7 +246,7 @@ impl Ui {
             Some("plush"),
             None,
         );
-        card.set_anchor(Anchor::TOP | Anchor::RIGHT);
+        card.set_anchor(anchor(self.config.panel.position));
         // -1: never reserve space, so windows may use the full screen under us.
         card.set_exclusive_zone(-1);
         card.set_keyboard_interactivity(KeyboardInteractivity::None);
@@ -570,3 +606,36 @@ impl ProvidesRegistryState for Ui {
 }
 
 smithay_client_toolkit::delegate_dispatch2!(Ui);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_anchor_matches_the_position() {
+        assert_eq!(anchor(Position::TopLeft), Anchor::TOP | Anchor::LEFT);
+        assert_eq!(anchor(Position::BottomLeft), Anchor::BOTTOM | Anchor::LEFT);
+        assert_eq!(anchor(Position::TopCenter), Anchor::TOP);
+        assert_eq!(anchor(Position::BottomCenter), Anchor::BOTTOM);
+        assert_eq!(anchor(Position::TopRight), Anchor::TOP | Anchor::RIGHT);
+        assert_eq!(anchor(Position::BottomRight), Anchor::BOTTOM | Anchor::RIGHT);
+    }
+
+    /// `set_margin` takes top, right, bottom, left. Only anchored edges get a margin, and
+    /// the stack is measured from the anchored edge, so a bottom position grows upwards.
+    #[test]
+    fn the_stack_starts_at_the_named_corner_and_grows_away_from_its_edge() {
+        assert_eq!(margins(Position::TopLeft, 0), (MARGIN, 0, 0, MARGIN));
+        assert_eq!(margins(Position::TopLeft, 50), (MARGIN + 50, 0, 0, MARGIN));
+
+        assert_eq!(margins(Position::BottomLeft, 0), (0, 0, MARGIN, MARGIN));
+        assert_eq!(margins(Position::BottomLeft, 50), (0, 0, MARGIN + 50, MARGIN));
+
+        assert_eq!(margins(Position::TopRight, 0), (MARGIN, MARGIN, 0, 0));
+        assert_eq!(margins(Position::BottomRight, 50), (0, MARGIN, MARGIN + 50, 0));
+
+        // A centred column is anchored to no side, so it takes no side margin.
+        assert_eq!(margins(Position::TopCenter, 0), (MARGIN, 0, 0, 0));
+        assert_eq!(margins(Position::BottomCenter, 7), (0, 0, MARGIN + 7, 0));
+    }
+}
