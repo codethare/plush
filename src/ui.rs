@@ -34,6 +34,7 @@ use wayland_client::{
 };
 
 use crate::{
+    config::Config,
     dbus::{CloseRequest, Notification, Shared, REASON_DISMISSED, REASON_EXPIRED},
     render,
 };
@@ -71,6 +72,7 @@ pub struct Ui {
     layer_shell: LayerShell,
     shm: Shm,
     pool: SlotPool,
+    config: Config,
     font_system: FontSystem,
     swash: SwashCache,
     store: Shared,
@@ -90,6 +92,7 @@ impl Ui {
         layer_shell: LayerShell,
         shm: Shm,
         pool: SlotPool,
+        config: Config,
         store: Shared,
         closed: async_channel::Sender<CloseRequest>,
     ) -> Self {
@@ -103,6 +106,7 @@ impl Ui {
             layer_shell,
             shm,
             pool,
+            config,
             font_system: FontSystem::new(),
             swash: SwashCache::new(),
             store,
@@ -158,7 +162,7 @@ impl Ui {
     }
 
     fn make_card(&mut self, notification: &Notification) -> Card {
-        let mut content = render::build(&mut self.font_system, notification);
+        let mut content = render::build(&mut self.font_system, &self.config, notification);
         let height = render::card_height(&mut self.font_system, &mut content);
 
         let surface = self.compositor.create_surface(&self.qh);
@@ -351,6 +355,7 @@ impl LayerShellHandler for Ui {
             canvas,
             width,
             height,
+            &self.config,
             &mut self.font_system,
             &mut self.swash,
             &mut card.content,

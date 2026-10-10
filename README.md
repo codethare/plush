@@ -67,14 +67,72 @@ Click a panel to dismiss it.
 | `GetCapabilities` | `["body"]` |
 | `GetServerInformation` | `plush`, `plush`, version, `1.2` |
 
+## Configuration
+
+plush reads `$XDG_CONFIG_HOME/plush/config.toml`, which is `~/.config/plush/config.toml`
+unless `XDG_CONFIG_HOME` has been moved. The file is optional, and so is every key in it:
+anything you leave out keeps the default shown below. `data/config.toml` in this repository is
+a copyable example that spells out every key at its default.
+
+```sh
+mkdir -p ~/.config/plush
+cp data/config.toml ~/.config/plush/config.toml
+```
+
+A file that is present but wrong stops the daemon with a parser error naming the file, the
+line and the column. Unknown keys and unknown tables are rejected too, so a typo cannot leave
+you staring at a panel that quietly ignored your setting.
+
+Colours are `#rgb`, `#rgba`, `#rrggbb` or `#rrggbbaa`. The shorthand repeats each digit, so
+`#abc` is `#aabbcc`. The alpha channel is meaningful: below `ff` the panel is translucent over
+whatever is behind it.
+
+### `[border]`
+
+| Key | Default | |
+|---|---|---|
+| `width` | `1.0` | Stroke width in logical pixels. `0` draws no border. |
+| `color` | `"#ffffff1a"` | A 10% white highlight. |
+
+### `[background]`
+
+| Key | Default | |
+|---|---|---|
+| `color` | `"#1c1c1ed6"` | A translucent dark grey. |
+
+### `[font]`
+
+| Key | Default | |
+|---|---|---|
+| `family` | `"sans-serif"` | Any installed family, or a generic: `sans-serif`, `serif`, `monospace`, `cursive`, `fantasy`. |
+| `app-size` | `11.0` | The app name line. |
+| `app-line-height` | `15.0` | |
+| `app-weight` | `"medium"` | |
+| `title-size` | `14.0` | The summary line. |
+| `title-line-height` | `19.0` | |
+| `title-weight` | `"bold"` | |
+| `body-size` | `13.0` | The body text. |
+| `body-line-height` | `18.0` | |
+| `body-weight` | `"normal"` | |
+
+Weights are named: `thin`, `extra-light`, `light`, `normal`, `medium`, `semibold`, `bold`,
+`extra-bold`, `black`.
+
+`title-weight = "bold"` is the default rather than `"semibold"` on purpose. fontconfig resolves
+weight 600 for the generic sans family to a serif CJK face whose space glyph is missing, which
+then falls back to a colour-emoji space seventeen pixels wide and leaves a hole in the title.
+`semibold` is accepted, and is fine when the family you name actually has that weight.
+
 ## Deliberately not implemented
 
-- No configuration file. The palette, width, position and limits are compile-time constants.
+- No configuration beyond the border, the background and the font. Panel width, position,
+  padding, corner radius, the stack limit and the text colours are compile-time constants.
 - No icon rendering: `app_icon` is accepted and ignored.
 - No markup: `body-markup` is not advertised, so clients send plain text.
 - No action buttons: `actions` is accepted, `ActionInvoked` is never emitted.
 - No grouping or notification history.
-- No light theme: one dark palette, no `color-scheme` detection.
+- No light theme. The text inks are constants and are not configurable, so a light
+  `background.color` gives white-on-light text and poor contrast. No `color-scheme` detection.
 - No keyboard handling: panels never take focus.
 - Corners are circular arcs, not Apple's continuous-curvature squircles.
 - Panels are positioned in logical pixels; output scale is not consulted, so a HiDPI
@@ -98,12 +156,14 @@ mutates the queue and pings; the main thread reconciles its panels against the q
 the main thread retires a notification (expiry or click) it pushes a reason back over an
 `async_channel` for the D-Bus thread to emit. Neither thread blocks on the other.
 
-Two consequences worth knowing:
+Three consequences worth knowing:
 
 - **A panel is drawn only from `configure`.** The compositor's suggested size is the single
   source of truth for surface state, so a buffer can never be attached with stale geometry.
 - **Replacing a notification rebuilds its surface.** A commit without a new buffer does not
   repaint, so a fresh surface is the reliable way to get a fresh `configure`.
+- **Configuration is read once, at startup.** It is parsed into a `Config` that the renderer
+  then reads as plain values. There is no reload, so editing the file needs a restart.
 
 Text is shaped with `cosmic-text` and rasterised through `SwashCache` by hand. The glyph
 path deliberately avoids `cosmic_text::Buffer::draw`, which hides the coverage and
@@ -118,6 +178,9 @@ end, because `wl_shm`'s `Argb8888` is BGRA in memory while `tiny-skia` paints RG
   Wayland protocol trace.
 - Panel pixels are covered by unit tests asserting the rounded corners, the opaque
   interior, and that a title never falls back to a second font mid-run.
+- Configuration is covered by unit tests for colour shorthand, partial files, and the
+  rejection of unknown keys, plus a test asserting `data/config.toml` still documents the
+  defaults exactly.
 
 ## License
 

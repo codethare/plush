@@ -4,12 +4,10 @@
 //! `cosmic_text::Buffer::draw`: that callback hides the coverage/premultiplication
 //! convention, and the canvas has to end up premultiplied *and* channel-swapped.
 
-use cosmic_text::{
-    Attrs, Buffer, FontSystem, Metrics, Shaping, SwashCache, SwashContent, SwashImage, Weight,
-};
+use cosmic_text::{Attrs, Buffer, FontSystem, Shaping, SwashCache, SwashContent, SwashImage};
 use tiny_skia::{Color, FillRule, Paint, Path, PathBuilder, PixmapMut, Stroke, Transform};
 
-use crate::dbus::Notification;
+use crate::{config::Config, dbus::Notification};
 
 /// Panel width in logical pixels.
 pub const PANEL_W: u32 = 380;
@@ -22,8 +20,6 @@ const PAD: f32 = 16.0;
 const RADIUS: f32 = 14.0;
 const MIN_H: u32 = 60;
 
-const PANEL_BG: (u8, u8, u8, u8) = (28, 28, 30, 214);
-const PANEL_EDGE: (u8, u8, u8, u8) = (255, 255, 255, 26);
 const INK_PRIMARY: cosmic_text::Color = cosmic_text::Color::rgba(255, 255, 255, 245);
 const INK_SECONDARY: cosmic_text::Color = cosmic_text::Color::rgba(235, 235, 245, 155);
 const INK_TERTIARY: cosmic_text::Color = cosmic_text::Color::rgba(235, 235, 245, 115);
@@ -32,13 +28,10 @@ fn text_width() -> f32 {
     PANEL_W as f32 - 2.0 * PAD
 }
 
-fn body_metrics() -> Metrics {
-    Metrics::new(13.0, 18.0)
-}
-
 /// Shapes a notification into a wrapped, styled buffer.
-pub fn build(font_system: &mut FontSystem, notification: &Notification) -> Buffer {
-    let mut buffer = Buffer::new(font_system, body_metrics());
+pub fn build(font_system: &mut FontSystem, config: &Config, notification: &Notification) -> Buffer {
+    let font = &config.font;
+    let mut buffer = Buffer::new(font_system, font.body_metrics());
     buffer.set_size(Some(text_width()), Some(MAX_H as f32 - 2.0 * PAD));
 
     let mut parts: Vec<(String, Attrs)> = Vec::new();
@@ -46,25 +39,28 @@ pub fn build(font_system: &mut FontSystem, notification: &Notification) -> Buffe
         parts.push((
             notification.app_name.clone(),
             Attrs::new()
-                .metrics(Metrics::new(11.0, 15.0))
+                .family(font.family())
+                .metrics(font.app_metrics())
                 .color(INK_TERTIARY)
-                .weight(Weight::MEDIUM),
+                .weight(font.app_weight.0),
         ));
     }
     parts.push((
         notification.summary.clone(),
         Attrs::new()
-            .metrics(Metrics::new(14.0, 19.0))
+            .family(font.family())
+            .metrics(font.title_metrics())
             .color(INK_PRIMARY)
-            // Bold, not semibold: fontconfig resolves weight 600 for the generic
-            // sans family to a serif CJK face whose space glyph is missing, which
-            // then falls back to a colour-emoji space seventeen pixels wide.
-            .weight(Weight::BOLD),
+            .weight(font.title_weight.0),
     ));
     if !notification.body.is_empty() {
         parts.push((
             notification.body.clone(),
-            Attrs::new().metrics(body_metrics()).color(INK_SECONDARY),
+            Attrs::new()
+                .family(font.family())
+                .metrics(font.body_metrics())
+                .color(INK_SECONDARY)
+                .weight(font.body_weight.0),
         ));
     }
 
@@ -81,7 +77,7 @@ pub fn build(font_system: &mut FontSystem, notification: &Notification) -> Buffe
         .collect();
     buffer.set_rich_text(
         spans,
-        &Attrs::new().metrics(body_metrics()),
+        &Attrs::new().family(font.family()).metrics(font.body_metrics()),
         Shaping::Advanced,
         None,
     );
@@ -100,12 +96,13 @@ pub fn paint(
     canvas: &mut [u8],
     width: u32,
     height: u32,
+    config: &Config,
     font_system: &mut FontSystem,
     swash: &mut SwashCache,
     buffer: &mut Buffer,
 ) {
     let pixels = &mut canvas[..width as usize * height as usize * 4];
-    panel(pixels, width, height);
+    panel(pixels, width, height, config);
     text(pixels, width, height, font_system, swash, buffer);
     // wl_shm's Argb8888 is BGRA in memory on little-endian; tiny-skia draws RGBA.
     for pixel in pixels.chunks_exact_mut(4) {
@@ -113,15 +110,16 @@ pub fn paint(
     }
 }
 
-fn panel(pixels: &mut [u8], width: u32, height: u32) {
+fn panel(pixels: &mut [u8], width: u32, height: u32, config: &Config) {
     let Some(mut pixmap) = PixmapMut::from_bytes(pixels, width, height) else {
         return;
     };
     pixmap.fill(Color::TRANSPARENT);
 
     let (w, h) = (width as f32, height as f32);
+    let background = config.background.color;
     let mut fill = Paint::default();
-    fill.set_color_rgba8(PANEL_BG.0, PANEL_BG.1, PANEL_BG.2, PANEL_BG.3);
+    fill.set_color_rgba8(background.0, background.1, background.2, background.3);
     fill.anti_alias = true;
     pixmap.fill_path(
         &rounded_rect(0.0, 0.0, w, h, RADIUS),
@@ -131,15 +129,23 @@ fn panel(pixels: &mut [u8], width: u32, height: u32) {
         None,
     );
 
-    // Inset by half a pixel so the hairline lands inside the panel.
+    let stroke_width = config.border.width;
+    // Zero means no border, and tiny-skia would draw a one-pixel hairline for it
+    // anyway. A stroke at least as wide as the panel would invert the inset path.
+    if stroke_width <= 0.0 || stroke_width >= w.min(h) {
+        return;
+    }
+
+    // Inset by half the stroke so the whole border lands inside the panel.
+    let border = config.border.color;
     let mut edge = Paint::default();
-    edge.set_color_rgba8(PANEL_EDGE.0, PANEL_EDGE.1, PANEL_EDGE.2, PANEL_EDGE.3);
+    edge.set_color_rgba8(border.0, border.1, border.2, border.3);
     edge.anti_alias = true;
-    let stroke = Stroke { width: 1.0, ..Stroke::default() };
+    let inset = stroke_width / 2.0;
     pixmap.stroke_path(
-        &rounded_rect(0.5, 0.5, w - 1.0, h - 1.0, RADIUS - 0.5),
+        &rounded_rect(inset, inset, w - stroke_width, h - stroke_width, RADIUS - inset),
         &edge,
-        &stroke,
+        &Stroke { width: stroke_width, ..Stroke::default() },
         Transform::identity(),
         None,
     );
@@ -235,7 +241,7 @@ fn blit(
 }
 
 fn rounded_rect(x: f32, y: f32, w: f32, h: f32, radius: f32) -> Path {
-    let r = radius.min(w / 2.0).min(h / 2.0);
+    let r = radius.max(0.0).min(w / 2.0).min(h / 2.0);
     let mut path = PathBuilder::new();
     path.move_to(x + r, y);
     path.line_to(x + w - r, y);
@@ -255,14 +261,22 @@ mod tests {
     use super::*;
     use crate::dbus::Notification;
 
-    fn render(sample: Notification) -> (Vec<u8>, u32, u32, FontSystem) {
+    fn render_with(config: Config, sample: Notification) -> (Vec<u8>, u32, u32) {
         let mut font_system = FontSystem::new();
-        let mut buffer = build(&mut font_system, &sample);
+        let mut buffer = build(&mut font_system, &config, &sample);
         let height = card_height(&mut font_system, &mut buffer);
         let mut canvas = vec![0u8; PANEL_W as usize * height as usize * 4];
         let mut swash = SwashCache::new();
-        paint(&mut canvas, PANEL_W, height, &mut font_system, &mut swash, &mut buffer);
-        (canvas, PANEL_W, height, font_system)
+        paint(
+            &mut canvas,
+            PANEL_W,
+            height,
+            &config,
+            &mut font_system,
+            &mut swash,
+            &mut buffer,
+        );
+        (canvas, PANEL_W, height)
     }
 
     fn sample() -> Notification {
@@ -277,7 +291,7 @@ mod tests {
 
     #[test]
     fn panel_has_the_expected_shape_and_colours() {
-        let (canvas, width, height, _) = render(sample());
+        let (canvas, width, height) = render_with(Config::default(), sample());
         let (w, h) = (width as usize, height as usize);
 
         let interior = canvas[(h / 2 * w + w / 2) * 4 + 3];
@@ -300,7 +314,7 @@ mod tests {
     #[test]
     fn title_is_shaped_from_one_font() {
         let mut font_system = FontSystem::new();
-        let mut buffer = build(&mut font_system, &sample());
+        let mut buffer = build(&mut font_system, &Config::default(), &sample());
         buffer.shape_until_scroll(&mut font_system, false);
 
         let title = buffer
@@ -328,7 +342,36 @@ mod tests {
             body: "wrapping words ".repeat(400),
             timeout: None,
         };
-        let mut buffer = build(&mut font_system, &long);
+        let mut buffer = build(&mut font_system, &Config::default(), &long);
         assert_eq!(card_height(&mut font_system, &mut buffer), MAX_H);
+    }
+
+    #[test]
+    fn configured_colours_and_border_reach_the_pixels() {
+        let plain: Config = toml::from_str(
+            "[background]\ncolor = \"#ff0000ff\"\n\n[border]\nwidth = 0.0\n",
+        )
+        .unwrap();
+        let (canvas, width, height) = render_with(plain, sample());
+        let (w, h) = (width as usize, height as usize);
+
+        let centre = (h / 2 * w + w / 2) * 4;
+        // canvas is B,G,R,A after the swap
+        assert_eq!(&canvas[centre..centre + 3], &[0, 0, 255], "opaque red background");
+
+        let near_top = (w + w / 2) * 4;
+        assert_eq!(&canvas[near_top..near_top + 3], &[0, 0, 255], "width 0 draws no border");
+
+        let bordered: Config = toml::from_str(
+            "[background]\ncolor = \"#ff0000ff\"\n\n[border]\nwidth = 3.0\ncolor = \"#ffffffff\"\n",
+        )
+        .unwrap();
+        let (canvas, width, _) = render_with(bordered, sample());
+        let w = width as usize;
+        let near_top = (w + w / 2) * 4;
+        assert!(
+            canvas[near_top..near_top + 3].iter().all(|channel| *channel > 200),
+            "a 3px white border paints over the panel edge"
+        );
     }
 }

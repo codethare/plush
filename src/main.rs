@@ -1,3 +1,4 @@
+mod config;
 mod dbus;
 mod render;
 mod ui;
@@ -14,6 +15,16 @@ use smithay_client_toolkit::{
 use wayland_client::{globals::registry_queue_init, Connection};
 
 fn main() {
+    // Before anything else: a configuration file that exists but is wrong should
+    // stop the daemon, not be quietly ignored.
+    let config = match config::load() {
+        Ok(config) => config,
+        Err(err) => {
+            eprintln!("plush: {err}");
+            std::process::exit(1);
+        }
+    };
+
     let connection =
         Connection::connect_to_env().expect("plush: no Wayland compositor in this session");
     let (globals, event_queue) =
@@ -55,6 +66,7 @@ fn main() {
         layer_shell,
         shm,
         pool,
+        config,
         store,
         closed,
     );

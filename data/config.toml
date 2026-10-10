@@ -1,0 +1,40 @@
+# plush configuration.
+#
+# Read from $XDG_CONFIG_HOME/plush/config.toml, which is ~/.config/plush/config.toml
+# unless XDG_CONFIG_HOME has been moved. The file is optional, and every key below is
+# shown at its default, so deleting the file — or any single line in it — changes
+# nothing. A file that is present but wrong is an error, not a silent fallback.
+#
+# Colours are #rgb, #rgba, #rrggbb or #rrggbbaa. The alpha channel matters: below ff
+# the panel is translucent over whatever is behind it.
+
+[border]
+# Stroke width in logical pixels. 0 draws no border.
+width = 1.0
+# A hairline highlight, 10% white.
+color = "#ffffff1a"
+
+[background]
+# Dark "system" grey, translucent.
+color = "#1c1c1ed6"
+
+[font]
+# Any installed family name, or the generic sans-serif, serif, monospace, cursive, fantasy.
+family = "sans-serif"
+
+# The app name line.
+app-size = 11.0
+app-line-height = 15.0
+app-weight = "medium"
+
+# The summary line. "bold" rather than "semibold" is deliberate: fontconfig resolves
+# weight 600 for the generic sans family to a serif CJK face whose space glyph is
+# missing, which then falls back to a colour-emoji space seventeen pixels wide.
+title-size = 14.0
+title-line-height = 19.0
+title-weight = "bold"
+
+# The body text.
+body-size = 13.0
+body-line-height = 18.0
+body-weight = "normal"
