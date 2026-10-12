@@ -5,6 +5,7 @@ edition = "2021"
 rust-version = "1.86"
 description = "A fast, minimal notification daemon for wlroots-based Wayland compositors"
 license = "MIT"
+repository = "https://github.com/codethare/plush"
 
 [dependencies]
 async-channel = "2"

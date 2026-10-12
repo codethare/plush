@@ -13,7 +13,7 @@ use std::{
 
 use calloop::ping::Ping;
 use zbus::object_server::SignalEmitter;
-use zvariant::OwnedValue;
+use zvariant::{OwnedValue, Value};
 
 pub const BUS_NAME: &str = "org.freedesktop.Notifications";
 pub const PATH: &str = "/org/freedesktop/Notifications";
@@ -33,6 +33,85 @@ const REASON_CLOSE_CALL: u32 = 3;
 
 type Hints = HashMap<String, OwnedValue>;
 
+/// An icon decoded from a notification's `image-data` hint, ready to draw.
+///
+/// Premultiplied RGBA, which is why it is decoded here rather than in the renderer: the
+/// paint path runs about twenty times a second for a panel with a countdown, and this is
+/// the layout `tiny_skia` blits without any conversion at all.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Icon {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
+/// The largest icon plush will hold on to. Anything bigger is scaled down to 32 px anyway,
+/// so the only thing the limit saves is the copy: a client must not be able to make the
+/// daemon carry a screenshot per notification.
+const MAX_ICON: i32 = 512;
+
+/// Decodes the `image-data` hint, if the client sent a usable one.
+///
+/// The hint is an `(iiibiiay)` structure of width, height, row stride, has-alpha, bits per
+/// sample, channel count and data. Both accepted channel counts are read as the cairo
+/// formats the hint names — `ARGB32` for four channels, `RGB24` for three — so the bytes are
+/// blue, green, red in memory, and with four channels the colours are already multiplied by
+/// the alpha. That is the reading every other daemon uses; `has_alpha` is not consulted,
+/// because the channel count is what says how the bytes are laid out.
+///
+/// Anything else is not an icon: a hint plush cannot read is dropped rather than guessed at,
+/// and the notification is shown as a text-only panel. Nothing here may panic — the hint
+/// comes off a bus that any client can write to.
+fn icon_from(hints: &Hints) -> Option<Icon> {
+    // `a{sv}` may hand the value back still wrapped in its variant.
+    let hint = hints.get("image-data")?;
+    let mut value: &Value<'_> = hint;
+    while let Value::Value(inner) = value {
+        value = inner;
+    }
+    let Value::Structure(structure) = value else {
+        return None;
+    };
+    let [width, height, stride, _has_alpha, bits, channels, data] = structure.fields() else {
+        return None;
+    };
+    let int = |value: &Value<'_>| value.downcast_ref::<i32>().ok();
+    let (width, height, stride, bits, channels) =
+        (int(width)?, int(height)?, int(stride)?, int(bits)?, int(channels)?);
+    if bits != 8 || !(3..=4).contains(&channels) {
+        return None;
+    }
+    if width <= 0 || height <= 0 || width > MAX_ICON || height > MAX_ICON {
+        return None;
+    }
+    let Value::Array(data) = data else {
+        return None;
+    };
+    let data: Vec<u8> = data
+        .inner()
+        .iter()
+        .map(|byte| byte.downcast_ref::<u8>().ok())
+        .collect::<Option<_>>()?;
+
+    let (width, height, stride, channels) =
+        (width as usize, height as usize, stride as usize, channels as usize);
+    // A row may be padded, so the stride says where each row starts and how much data there
+    // has to be. Checked, because both come from the client — and a negative stride would
+    // read as an enormous one.
+    if stride < width * channels || stride.checked_mul(height)? > data.len() {
+        return None;
+    }
+
+    let mut rgba = Vec::with_capacity(width * height * 4);
+    for row in data.chunks(stride).take(height) {
+        for pixel in row[..width * channels].chunks_exact(channels) {
+            let alpha = if channels == 4 { pixel[3] } else { u8::MAX };
+            rgba.extend_from_slice(&[pixel[2], pixel[1], pixel[0], alpha]);
+        }
+    }
+    Some(Icon { width: width as u32, height: height as u32, rgba })
+}
+
 #[derive(Clone, Debug)]
 pub struct Notification {
     pub id: u32,
@@ -41,6 +120,8 @@ pub struct Notification {
     pub body: String,
     /// `None` means the client asked for a notification that never expires.
     pub timeout: Option<Duration>,
+    /// The `image-data` hint, or `None` when the client sent none or one that is unreadable.
+    pub icon: Option<Icon>,
 }
 
 /// "This id left the screen, for this reason" — sent UI thread to D-Bus thread.
@@ -153,7 +234,7 @@ impl Notifications {
         summary: String,
         body: String,
         _actions: Vec<String>,
-        _hints: Hints,
+        hints: Hints,
         expire_timeout: i32,
     ) -> u32 {
         let timeout = match expire_timeout {
@@ -161,6 +242,7 @@ impl Notifications {
             ms if ms > 0 => Some(Duration::from_millis(ms as u64)),
             _ => Some(DEFAULT_TIMEOUT),
         };
+        let icon = icon_from(&hints);
 
         let id = {
             let mut store = self.store.lock().unwrap();
@@ -173,7 +255,7 @@ impl Notifications {
             store.items.retain(|n| n.id != id);
             store.items.insert(
                 0,
-                Notification { id, app_name, summary, body, timeout },
+                Notification { id, app_name, summary, body, timeout, icon },
             );
             id
         };
@@ -262,6 +344,7 @@ mod tests {
                 summary: summary.into(),
                 body: String::new(),
                 timeout: None,
+                icon: None,
             },
         );
     }
@@ -318,5 +401,166 @@ mod tests {
         control.dismiss_all();
 
         assert!(requests.try_recv().is_err(), "nothing to announce");
+    }
+
+    /// A hint the way a client puts one on the wire: the seven `image-data` fields, as a
+    /// variant inside the hint dictionary.
+    fn image_data(
+        width: i32,
+        height: i32,
+        stride: i32,
+        has_alpha: bool,
+        bits: i32,
+        channels: i32,
+        data: Vec<u8>,
+    ) -> Hints {
+        let structure = zvariant::Structure::from((
+            width, height, stride, has_alpha, bits, channels, data,
+        ));
+        hints("image-data", Value::Structure(structure))
+    }
+
+    fn hints(name: &str, value: Value<'static>) -> Hints {
+        let mut hints = Hints::new();
+        hints.insert(name.to_string(), OwnedValue::try_from(value).expect("an owned value"));
+        hints
+    }
+
+    /// Four channels are cairo's ARGB32: blue, green, red, alpha in memory, with the
+    /// colours already multiplied by the alpha.
+    #[test]
+    fn a_four_channel_hint_becomes_premultiplied_rgba() {
+        let hint = image_data(2, 1, 8, true, 8, 4, vec![10, 20, 30, 40, 50, 60, 70, 80]);
+
+        let icon = icon_from(&hint).expect("a usable hint");
+
+        assert_eq!((icon.width, icon.height), (2, 1));
+        assert_eq!(icon.rgba, vec![30, 20, 10, 40, 70, 60, 50, 80], "BGRa in, RGBA out");
+    }
+
+    /// Three channels are cairo's RGB24: no alpha byte at all, so every pixel is opaque.
+    #[test]
+    fn a_three_channel_hint_is_opaque() {
+        let hint = image_data(2, 1, 6, false, 8, 3, vec![10, 20, 30, 50, 60, 70]);
+
+        let icon = icon_from(&hint).expect("a usable hint");
+
+        assert_eq!(icon.rgba, vec![30, 20, 10, 255, 70, 60, 50, 255]);
+    }
+
+    /// A row is allowed to be padded to a wider stride, so rows must not be read as though
+    /// they were packed.
+    #[test]
+    fn a_padded_row_stride_is_respected() {
+        let hint = image_data(
+            1,
+            2,
+            8,
+            true,
+            8,
+            4,
+            vec![10, 20, 30, 40, 9, 9, 9, 9, 50, 60, 70, 80, 9, 9, 9, 9],
+        );
+
+        let icon = icon_from(&hint).expect("a usable hint");
+
+        assert_eq!(icon.rgba, vec![30, 20, 10, 40, 70, 60, 50, 80], "padding is skipped");
+    }
+
+    /// The value may come back still wrapped in its variant, which is what `a{sv}` does.
+    #[test]
+    fn a_variant_wrapped_hint_is_unwrapped() {
+        let structure = zvariant::Structure::from((1, 1, 4, true, 8, 4, vec![1u8, 2, 3, 4]));
+        let wrapped = Value::Value(Box::new(Value::Structure(structure)));
+
+        let icon = icon_from(&hints("image-data", wrapped)).expect("a usable hint");
+
+        assert_eq!(icon.rgba, vec![3, 2, 1, 4]);
+    }
+
+    #[test]
+    fn hints_that_are_not_an_icon_are_dropped() {
+        let good = || vec![1u8, 2, 3, 4];
+        let cases: Vec<(&str, Hints)> = vec![
+            ("no hint at all", Hints::new()),
+            ("a hint under another name", hints("image-path", Value::Str("icon.png".into()))),
+            ("a plain string", hints("image-data", Value::Str("4x4".into()))),
+            ("a structure of three fields", {
+                let structure = zvariant::Structure::from((1, 1, 4));
+                hints("image-data", Value::Structure(structure))
+            }),
+            ("a data array that is not bytes", {
+                let structure = zvariant::Structure::from((1, 1, 4, true, 8, 4, vec![1i32, 2, 3, 4]));
+                hints("image-data", Value::Structure(structure))
+            }),
+            ("16 bits per sample", image_data(1, 1, 8, true, 16, 4, good())),
+            ("one channel", image_data(1, 1, 1, false, 8, 1, vec![1])),
+            ("five channels", image_data(1, 1, 5, true, 8, 5, vec![1, 2, 3, 4, 5])),
+            ("no width", image_data(0, 1, 4, true, 8, 4, good())),
+            ("a negative height", image_data(1, -1, 4, true, 8, 4, good())),
+            ("a stride narrower than a row", image_data(2, 1, 4, true, 8, 4, good())),
+            ("a negative stride", image_data(2, 1, -8, true, 8, 4, good())),
+            ("less data than it claims", image_data(4, 4, 16, true, 8, 4, good())),
+            ("an image too big to hold", image_data(4096, 4096, 16384, true, 8, 4, good())),
+        ];
+
+        for (what, hint) in cases {
+            assert!(icon_from(&hint).is_none(), "{what} should not become an icon");
+        }
+    }
+
+    /// A `Notify` with an unreadable hint still has to answer, and still has to show the
+    /// text: the panel only loses its icon.
+    #[test]
+    fn a_notification_carries_the_icon_it_was_sent() {
+        let store = shared();
+        let (ping, _source) = make_ping().expect("an eventfd");
+        let notifications = Notifications { store: store.clone(), ping };
+        let call = |hints: Hints| {
+            async_io::block_on(notifications.notify(
+                "test".into(),
+                0,
+                String::new(),
+                "summary".into(),
+                "body".into(),
+                Vec::new(),
+                hints,
+                -1,
+            ))
+        };
+
+        let id = call(image_data(1, 1, 4, true, 8, 4, vec![1, 2, 3, 4]));
+        let id_without_icon = call(hints("image-data", Value::Str("nope".into())));
+
+        let items = store.lock().unwrap();
+        let with_icon = items.items.iter().find(|n| n.id == id).expect("the first notification");
+        let without = items
+            .items
+            .iter()
+            .find(|n| n.id == id_without_icon)
+            .expect("the second notification");
+        assert_eq!(with_icon.icon.as_ref().map(|icon| icon.rgba.clone()), Some(vec![3, 2, 1, 4]));
+        assert_eq!(without.icon, None, "an unreadable hint leaves a text-only panel");
+        assert_eq!(without.summary, "summary", "and the notification is still there");
+    }
+
+    #[test]
+    fn a_notification_with_no_timeout_never_expires() {
+        let store = shared();
+        let (ping, _source) = make_ping().expect("an eventfd");
+        let notifications = Notifications { store: store.clone(), ping };
+
+        async_io::block_on(notifications.notify(
+            "test".into(),
+            0,
+            String::new(),
+            "summary".into(),
+            String::new(),
+            Vec::new(),
+            Hints::new(),
+            0,
+        ));
+
+        assert_eq!(store.lock().unwrap().items[0].timeout, None);
     }
 }

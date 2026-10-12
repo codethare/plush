@@ -84,9 +84,12 @@ place, in which case the bus starts the daemon first and there is then nothing t
 |---|---|
 | Position | `top-right` by default; 16 px from the edges it is anchored to |
 | Panel | 380 px wide, 14 px corner radius, 16 px padding |
+| Icon | the `image-data` hint, fitted into a 32 px slot to the left of the text and never enlarged; `image-path` and `app_icon` are ignored |
 | Stack | up to 4 panels, 10 px apart, newest on top |
 | Max height | 320 px; longer bodies are clipped |
 | Expiry | per-notification; `-1` becomes 5000 ms, `0` never expires |
+| Hold | a pointer inside a panel pauses its timeout; leaving resumes with the time that was left |
+| Countdown | a 2 px line inside the bottom edge showing how much of the timeout is left; a notification that never expires has none |
 | Animation | slides in from the nearest edge and fades up over 220 ms; the same motion reversed on the way out |
 | `replaces_id` | replaces the content in place and restarts the timeout |
 | Dismiss | pointer press, `CloseNotification`, or `plush dismiss` |
@@ -188,14 +191,18 @@ The surface itself never moves. `zwlr_layer_shell_v1` only honours margins on ed
 have anchored to, and sliding in from off-screen would need a negative margin, which the
 protocol never promises — so the slide is drawn inside the buffer and works the same on
 every compositor. Frames are driven by a timer at 60 Hz that only runs while something is
-moving; with `enabled = false` there is no timer at all and panels simply appear.
+moving; with `enabled = false` panels simply appear. A panel with a timeout is repainted
+about twenty times a second while its countdown line drains, with or without animation.
 
 ## Deliberately not implemented
 
 - No configuration beyond the position, the border, the background, the font and the
-  animation toggle. Panel width, padding, corner radius, the stack limit and the text
-  colours are compile-time constants.
-- No icon rendering: `app_icon` is accepted and ignored.
+  animation toggle. Panel width, padding, corner radius, the stack limit, the text colours,
+  the icon size and the countdown line are compile-time constants.
+- No icon from `image-path`, from `app_icon` or from an icon theme: only the pixels a client
+  puts in `image-data` are drawn, so an app that sends a path or a theme name still gets a
+  text-only panel. An `image-data` hint is taken as 8 bits per sample, 3 or 4 channels, and
+  at most 512 px on a side.
 - No markup: `body-markup` is not advertised, so clients send plain text.
 - No action buttons: `actions` is accepted, `ActionInvoked` is never emitted.
 - No grouping or notification history.
@@ -204,6 +211,8 @@ moving; with `enabled = false` there is no timer at all and panels simply appear
 - No light theme. The text inks are constants and are not configurable, so a light
   `background.color` gives white-on-light text and poor contrast. No `color-scheme` detection.
 - No keyboard handling: panels never take focus.
+- No hover highlight and no close button: the pointer holds a panel open and a press
+  dismisses it, and that is all it does.
 - Corners are circular arcs, not Apple's continuous-curvature squircles.
 - Panels are positioned in logical pixels; output scale is not consulted, so a HiDPI
   output gets a panel that is physically smaller.
@@ -259,6 +268,20 @@ end, because `wl_shm`'s `Argb8888` is BGRA in memory while `tiny-skia` paints RG
   Wayland protocol trace.
 - Panel pixels are covered by unit tests asserting the rounded corners, the opaque
   interior, and that a title never falls back to a second font mid-run.
+- Icons and the countdown line are covered by unit tests for the slot geometry, the aspect
+  ratio, the vertical centring, the wrap width beside a slot, the length of the line against
+  the timeout, and that neither is drawn without a hint or without a timeout — plus the
+  `image-data` parse, including every shape of hint that has to be refused rather than
+  guessed at.
+- The hold is covered by unit tests for the remaining time, the resumption with what was
+  left rather than the client's timeout again, a hold that never extends a panel's life, and
+  a hold on a panel that never expires.
+- End to end against a headless sway, with the panels read back off the screen: a 64×64
+  `image-data` hint paints a 32×32 icon inside the slot, a hint that is a string or a
+  structure of three fields is refused without disturbing the panel, a `replaces_id` that
+  changes only the icon swaps that icon in place on a panel that keeps its size, a `-t 0`
+  notification draws no countdown line and a timed one drains from its right end, and a
+  session of all of it logs no `wl_display` error.
 - Configuration is covered by unit tests for colour shorthand, partial files, and the
   rejection of unknown keys, plus tests asserting that a missing file falls back to the
   bundled `data/config.toml`, that a user file overrides it, and that the bundled values are
@@ -268,8 +291,9 @@ end, because `wl_shm`'s `Argb8888` is BGRA in memory while `tiny-skia` paints RG
   settled panel is painted exactly as it was before animations existed.
 - Measured against a headless sway with the protocol traced: 17 ms between frames (60 Hz),
   roughly 15 frames to arrive and 12 to leave, and with `enabled = false` three paints in
-  2 ms and a quarter of the CPU. Four panels animating at once allocate no extra buffers,
-  leak no surfaces, and log no `wl_display` errors.
+  2 ms and a quarter of the CPU for a panel that never expires, against about twenty paints
+  a second while a countdown line is draining. Four panels animating at once allocate no
+  extra buffers, leak no surfaces, and log no `wl_display` errors.
 - The CLI is exercised end to end against a live daemon: `plush dismiss` closes exactly the
   top panel and `plush dismiss all` the rest, each announced as reason `2`; the surfaces are
   painted and destroyed without a `wl_display` error, dismissing a panel mid-animation works,

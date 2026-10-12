@@ -36,7 +36,7 @@ use wayland_client::{
 use crate::{
     anim::Anim,
     config::{Column, Config, Position, Row},
-    dbus::{CloseRequest, Notification, Shared, REASON_DISMISSED, REASON_EXPIRED},
+    dbus::{CloseRequest, Icon, Notification, Shared, REASON_DISMISSED, REASON_EXPIRED},
     render,
 };
 
@@ -46,6 +46,9 @@ const MARGIN: i32 = 16;
 const GAP: i32 = 10;
 /// One animation frame. 60 Hz, which is what the motion was tuned against.
 const FRAME: Duration = Duration::from_millis(16);
+/// One tick of the countdown. 20 Hz, which is enough for the line to read as draining
+/// rather than stepping, and cheap enough to run for the length of a notification.
+const TICK: Duration = Duration::from_millis(50);
 
 /// Where the stack is anchored. The centred columns leave both sides free, which is
 /// what makes the compositor centre the surface horizontally.
@@ -83,16 +86,103 @@ fn margins(position: Position, offset: i32) -> (i32, i32, i32, i32) {
 
 struct Card {
     id: u32,
-    /// The text this card was built from, so a `replaces_id` update is detected.
-    source: (String, String, String),
+    /// What this card was built from, so a `replaces_id` update is detected.
+    source: Source,
     surface: LayerSurface,
     content: Buffer,
+    /// Kept on the card rather than read back out of the queue: a card that is already
+    /// leaving is gone from the queue but still being painted.
+    icon: Option<Icon>,
     height: u32,
     /// The size the compositor last configured. Animation redraws need it, which is
     /// why a card cannot be painted before its first `configure`.
     size: Option<(u32, u32)>,
-    deadline: Option<Instant>,
+    timeouts: Timeouts,
     anim: Anim,
+}
+
+/// What a card was built from. A change in any of it means the card is rebuilt rather
+/// than patched, which is the only way to get a fresh `configure` to draw with — and an
+/// icon that changed under a constant `replaces_id` is such a change.
+#[derive(PartialEq)]
+struct Source {
+    app_name: String,
+    summary: String,
+    body: String,
+    icon: Option<Icon>,
+}
+
+impl Source {
+    fn of(notification: &Notification) -> Self {
+        Self {
+            app_name: notification.app_name.clone(),
+            summary: notification.summary.clone(),
+            body: notification.body.clone(),
+            icon: notification.icon.clone(),
+        }
+    }
+
+    /// Compared against the notification rather than against another `Source`, so a
+    /// queued icon is never cloned just to be compared.
+    fn matches(&self, notification: &Notification) -> bool {
+        self.app_name == notification.app_name
+            && self.summary == notification.summary
+            && self.body == notification.body
+            && self.icon == notification.icon
+    }
+}
+
+/// When a card goes away, and what a hold does to that.
+///
+/// `timeout` is the client's total, which is the denominator of the countdown; `deadline`
+/// is when the card expires, and is absent both for a card that never expires and for one
+/// being held; `held` is the remaining time a hold froze. Keeping the held time here is
+/// what makes a hold resume with what was left rather than with the client's timeout
+/// again, and it is why `rearm` needs no special case: a held card has no deadline.
+#[derive(Clone, Copy, Debug)]
+struct Timeouts {
+    timeout: Option<Duration>,
+    deadline: Option<Instant>,
+    held: Option<Duration>,
+}
+
+impl Timeouts {
+    fn new(timeout: Option<Duration>, now: Instant) -> Self {
+        Self { timeout, deadline: timeout.map(|timeout| now + timeout), held: None }
+    }
+
+    /// Freezes the countdown where it is. A card that never expires, or one that is
+    /// already held, does not move.
+    fn hold(&mut self, now: Instant) {
+        if self.held.is_none() {
+            self.held = self.remaining(now);
+            self.deadline = None;
+        }
+    }
+
+    /// Resumes with the time that was left, not with the client's timeout again.
+    fn release(&mut self, now: Instant) {
+        if let Some(left) = self.held.take() {
+            self.deadline = Some(now + left);
+        }
+    }
+
+    fn remaining(&self, now: Instant) -> Option<Duration> {
+        self.held
+            .or_else(|| self.deadline.map(|deadline| deadline.saturating_duration_since(now)))
+    }
+
+    fn expired(&self, now: Instant) -> bool {
+        self.deadline.is_some_and(|deadline| deadline <= now)
+    }
+
+    /// How much of the client's timeout is left, which is the length of the countdown
+    /// line. `None` for a card that never expires, which has no line to draw.
+    fn fraction(&self, now: Instant) -> Option<f32> {
+        let timeout = self.timeout?;
+        let left = self.remaining(now)?;
+        Some((left.as_secs_f32() / timeout.as_secs_f32()).clamp(0.0, 1.0))
+    }
 }
 
 impl Card {
@@ -100,14 +190,6 @@ impl Card {
     fn leaving_done(&self, now: Instant) -> bool {
         self.anim.leaving() && self.anim.finished(now)
     }
-}
-
-fn source_of(notification: &Notification) -> (String, String, String) {
-    (
-        notification.app_name.clone(),
-        notification.summary.clone(),
-        notification.body.clone(),
-    )
 }
 
 pub struct Ui {
@@ -130,6 +212,8 @@ pub struct Ui {
     expiry: Option<RegistrationToken>,
     /// The frame timer, alive only while something is moving.
     frame: Option<RegistrationToken>,
+    /// The countdown timer, alive only while a line is draining.
+    tick: Option<RegistrationToken>,
 }
 
 impl Ui {
@@ -165,6 +249,7 @@ impl Ui {
             pointer: None,
             expiry: None,
             frame: None,
+            tick: None,
         }
     }
 
@@ -191,7 +276,7 @@ impl Ui {
             let unchanged = self
                 .cards
                 .iter()
-                .position(|card| card.id == notification.id && card.source == source_of(notification));
+                .position(|card| card.id == notification.id && card.source.matches(notification));
             match unchanged {
                 Some(index) => ordered.push(self.cards.remove(index)),
                 None => {
@@ -232,11 +317,13 @@ impl Ui {
 
         self.rearm();
         self.arm_frames();
+        self.arm_tick();
     }
 
     fn make_card(&mut self, notification: &Notification) -> Card {
+        let has_icon = notification.icon.is_some();
         let mut content = render::build(&mut self.font_system, &self.config, notification);
-        let height = render::card_height(&mut self.font_system, &mut content);
+        let height = render::card_height(&mut self.font_system, &mut content, has_icon);
 
         let surface = self.compositor.create_surface(&self.qh);
         let card = self.layer_shell.create_layer_surface(
@@ -256,11 +343,12 @@ impl Ui {
 
         Card {
             id: notification.id,
-            source: source_of(notification),
+            source: Source::of(notification),
             surface: card,
             content,
+            icon: notification.icon.clone(),
             height,
-            deadline: notification.timeout.map(|timeout| Instant::now() + timeout),
+            timeouts: Timeouts::new(notification.timeout, Instant::now()),
             anim: if self.config.animation.enabled {
                 Anim::entering()
             } else {
@@ -281,7 +369,7 @@ impl Ui {
         let expired: Vec<u32> = self
             .cards
             .iter()
-            .filter(|card| card.deadline.is_some_and(|deadline| deadline <= now))
+            .filter(|card| card.timeouts.expired(now))
             .map(|card| card.id)
             .collect();
         if expired.is_empty() {
@@ -307,7 +395,7 @@ impl Ui {
         if let Some(token) = self.expiry.take() {
             self.handle.remove(token);
         }
-        let deadline = self.cards.iter().filter_map(|card| card.deadline).min();
+        let deadline = self.cards.iter().filter_map(|card| card.timeouts.deadline).min();
         let Some(deadline) = deadline else {
             return;
         };
@@ -349,15 +437,19 @@ impl Ui {
         };
 
         let card = &mut self.cards[index];
+        let now = Instant::now();
+        let remaining = card.timeouts.fraction(now);
         render::paint(
             canvas,
             width,
             height,
             &self.config,
+            card.icon.as_ref(),
             &mut self.font_system,
             &mut self.swash,
             &mut card.content,
-            card.anim.progress(Instant::now()),
+            card.anim.progress(now),
+            remaining,
         );
 
         card.surface.wl_surface().damage_buffer(0, 0, width as i32, height as i32);
@@ -416,6 +508,77 @@ impl Ui {
             // The source removes itself here, so the token goes with it rather than
             // being left to name a slot some later source will reuse.
             self.frame = None;
+            TimeoutAction::Drop
+        }
+    }
+
+    /// Holds the countdown of the card under the pointer open. A card on its way out has
+    /// nothing left to hold.
+    fn hold(&mut self, id: u32) {
+        let now = Instant::now();
+        if let Some(card) = self
+            .cards
+            .iter_mut()
+            .find(|card| card.id == id && !card.anim.leaving())
+        {
+            card.timeouts.hold(now);
+        }
+        self.rearm();
+        self.arm_tick();
+    }
+
+    /// Puts a held card back on its timeout, with the time it had left. A card that is
+    /// on its way out is skipped for the same reason `hold` skips it: it has already
+    /// been announced as closed, and giving it a deadline again would announce it twice.
+    fn release(&mut self, id: u32) {
+        let now = Instant::now();
+        if let Some(card) = self
+            .cards
+            .iter_mut()
+            .find(|card| card.id == id && !card.anim.leaving())
+        {
+            card.timeouts.release(now);
+        }
+        self.rearm();
+        self.arm_tick();
+    }
+
+    /// Keeps one tick alive while any card has a countdown to draw. A held card has
+    /// none: its line is frozen, so there is nothing to repaint.
+    fn arm_tick(&mut self) {
+        if self.tick.is_some() || !self.draining() {
+            return;
+        }
+        let timer = calloop::timer::Timer::from_duration(TICK);
+        self.tick = self.handle.insert_source(timer, |_, _, ui: &mut Ui| ui.ticks()).ok();
+    }
+
+    /// Whether any card on screen has a countdown running.
+    fn draining(&self) -> bool {
+        self.cards
+            .iter()
+            .any(|card| !card.anim.leaving() && card.timeouts.deadline.is_some())
+    }
+
+    /// One countdown tick: repaint the cards whose line is draining. A card that is still
+    /// moving is left to the frame timer, which is already painting it.
+    fn ticks(&mut self) -> TimeoutAction {
+        for index in 0..self.cards.len() {
+            let settled = {
+                let card = &self.cards[index];
+                !card.anim.running() && card.timeouts.deadline.is_some()
+            };
+            if settled {
+                self.draw(index);
+            }
+        }
+
+        if self.draining() {
+            TimeoutAction::ToDuration(TICK)
+        } else {
+            // Like the frame timer, the source removes itself here, so the token goes
+            // with it rather than being left to name a slot some later source reuses.
+            self.tick = None;
             TimeoutAction::Drop
         }
     }
@@ -573,18 +736,25 @@ impl PointerHandler for Ui {
         events: &[PointerEvent],
     ) {
         for event in events {
-            if !matches!(event.kind, PointerEventKind::Press { .. }) {
-                continue;
-            }
-            let target = self
+            let Some(id) = self
                 .cards
                 .iter()
                 .find(|card| card.surface.wl_surface() == &event.surface)
-                .map(|card| card.id);
-            // Dismiss the frontmost hit and stop: `remove` rebuilds the card list.
-            if let Some(id) = target {
-                self.remove(id, REASON_DISMISSED);
-                return;
+                .map(|card| card.id)
+            else {
+                continue;
+            };
+            match event.kind {
+                // A card the pointer is inside is held open; leaving it puts it back on
+                // its timeout with the time that was left.
+                PointerEventKind::Enter { .. } => self.hold(id),
+                PointerEventKind::Leave { .. } => self.release(id),
+                // Dismiss the frontmost hit and stop: `remove` rebuilds the card list.
+                PointerEventKind::Press { .. } => {
+                    self.remove(id, REASON_DISMISSED);
+                    return;
+                }
+                _ => {}
             }
         }
     }
@@ -637,5 +807,93 @@ mod tests {
         // A centred column is anchored to no side, so it takes no side margin.
         assert_eq!(margins(Position::TopCenter, 0), (MARGIN, 0, 0, 0));
         assert_eq!(margins(Position::BottomCenter, 7), (0, 0, MARGIN + 7, 0));
+    }
+
+    /// A hold freezes the countdown; releasing it runs what was left, rather than the
+    /// client's timeout over again.
+    #[test]
+    fn a_hold_resumes_with_the_time_that_was_left() {
+        let start = Instant::now();
+        let mut timeouts = Timeouts::new(Some(Duration::from_secs(5)), start);
+        let held = start + Duration::from_secs(2);
+
+        timeouts.hold(held);
+        assert!(!timeouts.expired(held + Duration::from_secs(30)));
+        assert_eq!(timeouts.remaining(held + Duration::from_secs(30)), Some(Duration::from_secs(3)));
+        assert_eq!(timeouts.fraction(held + Duration::from_secs(30)), Some(0.6));
+
+        timeouts.release(held + Duration::from_secs(30));
+        assert_eq!(timeouts.deadline, Some(held + Duration::from_secs(33)));
+        assert_eq!(timeouts.remaining(held + Duration::from_secs(31)), Some(Duration::from_secs(2)));
+        assert!(!timeouts.expired(held + Duration::from_secs(32)));
+        assert!(timeouts.expired(held + Duration::from_secs(33)));
+    }
+
+    /// A hold is time the client never asked for: it pauses the countdown, it does not
+    /// add to it.
+    #[test]
+    fn a_hold_never_extends_the_total_timeout() {
+        let start = Instant::now();
+        let mut timeouts = Timeouts::new(Some(Duration::from_secs(2)), start);
+
+        timeouts.hold(start + Duration::from_secs(1));
+        timeouts.release(start + Duration::from_secs(61));
+
+        assert_eq!(timeouts.deadline, Some(start + Duration::from_secs(62)));
+        assert!(!timeouts.expired(start + Duration::from_secs(61)));
+        assert!(timeouts.expired(start + Duration::from_secs(62)));
+    }
+
+    /// A card the client asked to never expire has no countdown to freeze, so a hold is
+    /// a no-op rather than something that could give it a deadline.
+    #[test]
+    fn a_hold_on_a_panel_that_never_expires_is_a_no_op() {
+        let start = Instant::now();
+        let mut timeouts = Timeouts::new(None, start);
+
+        timeouts.hold(start + Duration::from_secs(1));
+        timeouts.hold(start + Duration::from_secs(2));
+        timeouts.release(start + Duration::from_secs(3));
+
+        assert_eq!(timeouts.deadline, None);
+        assert_eq!(timeouts.remaining(start + Duration::from_secs(9)), None);
+        assert_eq!(timeouts.fraction(start + Duration::from_secs(9)), None, "no line to draw");
+        assert!(!timeouts.expired(start + Duration::from_secs(9)));
+    }
+
+    /// The line is the fraction of the client's timeout that is left, which is what makes
+    /// it agree with the expiry it is counting down to.
+    #[test]
+    fn the_countdown_is_the_fraction_of_the_timeout_that_is_left() {
+        let start = Instant::now();
+        let timeouts = Timeouts::new(Some(Duration::from_millis(4000)), start);
+
+        assert_eq!(timeouts.fraction(start), Some(1.0));
+        assert_eq!(timeouts.fraction(start + Duration::from_secs(1)), Some(0.75));
+        assert_eq!(timeouts.fraction(start + Duration::from_secs(4)), Some(0.0));
+        assert_eq!(timeouts.fraction(start + Duration::from_secs(9)), Some(0.0));
+    }
+
+    /// A `replaces_id` that changes only the icon still has to rebuild the card, or the
+    /// new icon never reaches the screen.
+    #[test]
+    fn a_new_icon_is_a_change_to_rebuild_for() {
+        let icon = |pixel: u8| Some(Icon { width: 1, height: 1, rgba: vec![pixel, 0, 0, 255] });
+        let notification = |icon: Option<Icon>| Notification {
+            id: 7,
+            app_name: "app".into(),
+            summary: "summary".into(),
+            body: "body".into(),
+            timeout: None,
+            icon,
+        };
+
+        let original = Source::of(&notification(icon(1)));
+        assert!(original.matches(&notification(icon(1))), "the same icon is not a change");
+        assert!(!original.matches(&notification(icon(2))), "a different icon is");
+        assert!(!original.matches(&notification(None)), "and losing it is too");
+
+        let retexted = Notification { summary: "another summary".into(), ..notification(icon(1)) };
+        assert!(!original.matches(&retexted), "as is the text it was always watching");
     }
 }

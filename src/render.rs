@@ -5,11 +5,14 @@
 //! convention, and the canvas has to end up premultiplied *and* channel-swapped.
 
 use cosmic_text::{Attrs, Buffer, FontSystem, Shaping, SwashCache, SwashContent, SwashImage};
-use tiny_skia::{Color, FillRule, Paint, Path, PathBuilder, PixmapMut, Stroke, Transform};
+use tiny_skia::{
+    Color, FillRule, FilterQuality, Paint, Path, PathBuilder, Pattern, PixmapMut, PixmapRef,
+    SpreadMode, Stroke, Transform,
+};
 
 use crate::{
-    config::{Config, Edge},
-    dbus::Notification,
+    config::{Config, Edge, Rgba},
+    dbus::{Icon, Notification},
 };
 
 /// Panel width in logical pixels.
@@ -22,20 +25,34 @@ pub const MAX_CARDS: usize = 4;
 const PAD: f32 = 16.0;
 const RADIUS: f32 = 14.0;
 const MIN_H: u32 = 60;
+/// The icon slot, and the space between it and the text.
+const ICON: f32 = 32.0;
+const ICON_GAP: f32 = 12.0;
+/// The countdown line: a hairline of white that reads without competing with the text.
+const COUNTDOWN_H: f32 = 2.0;
+const COUNTDOWN_INK: Rgba = Rgba(255, 255, 255, 110);
 
 const INK_PRIMARY: cosmic_text::Color = cosmic_text::Color::rgba(255, 255, 255, 245);
 const INK_SECONDARY: cosmic_text::Color = cosmic_text::Color::rgba(235, 235, 245, 155);
 const INK_TERTIARY: cosmic_text::Color = cosmic_text::Color::rgba(235, 235, 245, 115);
 
-fn text_width() -> f32 {
-    PANEL_W as f32 - 2.0 * PAD
+fn text_width(has_icon: bool) -> f32 {
+    PANEL_W as f32 - PAD - text_x(has_icon)
+}
+
+/// Left edge of the text: the padding, or the far side of the icon slot.
+fn text_x(has_icon: bool) -> f32 {
+    PAD + if has_icon { ICON + ICON_GAP } else { 0.0 }
 }
 
 /// Shapes a notification into a wrapped, styled buffer.
 pub fn build(font_system: &mut FontSystem, config: &Config, notification: &Notification) -> Buffer {
     let font = &config.font;
     let mut buffer = Buffer::new(font_system, font.body_metrics());
-    buffer.set_size(Some(text_width()), Some(MAX_H as f32 - 2.0 * PAD));
+    buffer.set_size(
+        Some(text_width(notification.icon.is_some())),
+        Some(MAX_H as f32 - 2.0 * PAD),
+    );
 
     let mut parts: Vec<(String, Attrs)> = Vec::new();
     if !notification.app_name.is_empty() {
@@ -88,10 +105,15 @@ pub fn build(font_system: &mut FontSystem, config: &Config, notification: &Notif
 }
 
 /// Panel height needed by an already-`build`t buffer.
-pub fn card_height(font_system: &mut FontSystem, buffer: &mut Buffer) -> u32 {
+///
+/// `has_icon` is passed in because the slot and its padding are taller than a one-line
+/// panel would otherwise be, so a short notification with an icon is taller than the same
+/// text without one.
+pub fn card_height(font_system: &mut FontSystem, buffer: &mut Buffer, has_icon: bool) -> u32 {
     buffer.shape_until_scroll(font_system, false);
     let text: f32 = buffer.layout_runs().map(|run| run.line_height).sum();
-    ((text + 2.0 * PAD).ceil() as u32).clamp(MIN_H, MAX_H)
+    let floor = if has_icon { (ICON + 2.0 * PAD) as u32 } else { 0 };
+    ((text + 2.0 * PAD).ceil() as u32).clamp(MIN_H.max(floor), MAX_H)
 }
 
 /// Renders one panel into `canvas`.
@@ -100,16 +122,24 @@ pub fn card_height(font_system: &mut FontSystem, buffer: &mut Buffer) -> u32 {
 /// 1 is settled. Which side is the configured position, so a panel on the left slides
 /// right, one on the right slides left, and the centred ones drop in or rise. Cards
 /// drawn with animations turned off pass 1.0.
+///
+/// An `icon` is drawn in its slot to the left of the text, and arrives with the panel:
+/// it is offset, and faded, with everything else.
+///
+/// `remaining` is how much of the notification's timeout is left, which is the length of
+/// the countdown line; `None` for a notification that never expires, which has no line.
 #[allow(clippy::too_many_arguments)]
 pub fn paint(
     canvas: &mut [u8],
     width: u32,
     height: u32,
     config: &Config,
+    icon: Option<&Icon>,
     font_system: &mut FontSystem,
     swash: &mut SwashCache,
     buffer: &mut Buffer,
     progress: f32,
+    remaining: Option<f32>,
 ) {
     let pixels = &mut canvas[..width as usize * height as usize * 4];
     let progress = progress.clamp(0.0, 1.0);
@@ -129,7 +159,13 @@ pub fn paint(
     };
 
     panel(pixels, width, height, config, dx, dy);
-    text(pixels, width, height, font_system, swash, buffer, dx, dy);
+    if let Some(image) = icon {
+        draw_icon(pixels, width, height, image, dx, dy);
+    }
+    if let Some(remaining) = remaining {
+        countdown(pixels, width, height, config, remaining, dx, dy);
+    }
+    text(pixels, width, height, font_system, swash, buffer, icon.is_some(), dx, dy);
     // wl_shm's Argb8888 is BGRA in memory on little-endian; tiny-skia draws RGBA.
     for pixel in pixels.chunks_exact_mut(4) {
         pixel.swap(0, 2);
@@ -192,6 +228,91 @@ fn panel(pixels: &mut [u8], width: u32, height: u32, config: &Config, dx: f32, d
     );
 }
 
+/// Draws the icon in its slot: scaled to fit, never enlarged, and centred vertically in
+/// the panel. The scaling is a shader, so there is no resampler to keep correct here.
+fn draw_icon(pixels: &mut [u8], width: u32, height: u32, image: &Icon, dx: f32, dy: f32) {
+    let Some(mut pixmap) = PixmapMut::from_bytes(pixels, width, height) else {
+        return;
+    };
+    let Some(source) = PixmapRef::from_bytes(&image.rgba, image.width, image.height) else {
+        return;
+    };
+
+    let scale = (ICON / image.width as f32).min(ICON / image.height as f32).min(1.0);
+    let (w, h) = (image.width as f32 * scale, image.height as f32 * scale);
+    let (x, y) = (PAD + dx, (height as f32 - h) / 2.0 + dy);
+
+    let paint = Paint {
+        shader: Pattern::new(
+            source,
+            SpreadMode::Pad,
+            FilterQuality::Bilinear,
+            1.0,
+            Transform::from_scale(scale, scale).post_translate(x, y),
+        ),
+        ..Default::default()
+    };
+    pixmap.fill_path(
+        &rect(x, y, w, h),
+        &paint,
+        FillRule::Winding,
+        Transform::identity(),
+        None,
+    );
+}
+
+/// An axis-aligned rectangle, which is all an icon slot needs.
+fn rect(x: f32, y: f32, w: f32, h: f32) -> Path {
+    let mut path = PathBuilder::new();
+    path.move_to(x, y);
+    path.line_to(x + w, y);
+    path.line_to(x + w, y + h);
+    path.line_to(x, y + h);
+    path.close();
+    path.finish().expect("a rectangle is a valid path")
+}
+
+/// The countdown: a bar inside the bottom edge, its length the fraction of the timeout
+/// that is left, shortening from a fixed left end as the notification runs out.
+///
+/// It runs between the rounded corners rather than across the whole panel, because a
+/// straight bar in the bottom two rows would otherwise paint over the corner that gets
+/// rounded away.
+fn countdown(
+    pixels: &mut [u8],
+    width: u32,
+    height: u32,
+    config: &Config,
+    remaining: f32,
+    dx: f32,
+    dy: f32,
+) {
+    if remaining <= 0.0 {
+        return;
+    }
+    let Some(mut pixmap) = PixmapMut::from_bytes(pixels, width, height) else {
+        return;
+    };
+
+    let span = (width as f32 - 2.0 * RADIUS) * remaining.min(1.0);
+    let y = height as f32 - config.border.width - COUNTDOWN_H;
+    let mut ink = Paint::default();
+    ink.set_color_rgba8(
+        COUNTDOWN_INK.0,
+        COUNTDOWN_INK.1,
+        COUNTDOWN_INK.2,
+        COUNTDOWN_INK.3,
+    );
+    ink.anti_alias = true;
+    pixmap.fill_path(
+        &rect(RADIUS + dx, y + dy, span, COUNTDOWN_H),
+        &ink,
+        FillRule::Winding,
+        Transform::identity(),
+        None,
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 fn text(
     pixels: &mut [u8],
@@ -200,6 +321,7 @@ fn text(
     font_system: &mut FontSystem,
     swash: &mut SwashCache,
     buffer: &mut Buffer,
+    has_icon: bool,
     dx: f32,
     dy: f32,
 ) {
@@ -209,7 +331,7 @@ fn text(
             let Some(color) = glyph.color_opt else {
                 continue;
             };
-            let origin = glyph.physical((PAD + dx, PAD + dy + run.line_y), 1.0);
+            let origin = glyph.physical((text_x(has_icon) + dx, PAD + dy + run.line_y), 1.0);
             let Some(image) = swash.get_image(font_system, origin.cache_key) else {
                 continue;
             };
@@ -307,8 +429,9 @@ mod tests {
 
     fn render_with(config: Config, sample: Notification, progress: f32) -> (Vec<u8>, u32, u32) {
         let mut font_system = FontSystem::new();
+        let has_icon = sample.icon.is_some();
         let mut buffer = build(&mut font_system, &config, &sample);
-        let height = card_height(&mut font_system, &mut buffer);
+        let height = card_height(&mut font_system, &mut buffer, has_icon);
         let mut canvas = vec![0u8; PANEL_W as usize * height as usize * 4];
         let mut swash = SwashCache::new();
         paint(
@@ -316,12 +439,47 @@ mod tests {
             PANEL_W,
             height,
             &config,
+            sample.icon.as_ref(),
             &mut font_system,
             &mut swash,
             &mut buffer,
             progress,
+            None,
         );
         (canvas, PANEL_W, height)
+    }
+
+    /// A panel with a countdown on it and no text, so the line is the only ink on it.
+    fn render_countdown(config: Config, remaining: Option<f32>) -> (Vec<u8>, u32, u32) {
+        let mut font_system = FontSystem::new();
+        let mut buffer = Buffer::new(&mut font_system, config.font.body_metrics());
+        let mut canvas = vec![0u8; PANEL_W as usize * MIN_H as usize * 4];
+        let mut swash = SwashCache::new();
+        paint(
+            &mut canvas,
+            PANEL_W,
+            MIN_H,
+            &config,
+            None,
+            &mut font_system,
+            &mut swash,
+            &mut buffer,
+            1.0,
+            remaining,
+        );
+        (canvas, PANEL_W, MIN_H)
+    }
+
+    /// A panel with nothing in it but what is drawn on top of it, so an ink box is the
+    /// icon and the glyphs and nothing else.
+    fn transparent() -> Config {
+        toml::from_str("[background]\ncolor = \"#00000000\"\n\n[border]\nwidth = 0.0\n")
+            .expect("a transparent panel")
+    }
+
+    /// An icon of one flat colour, so a pixel can say where it came from.
+    fn solid_icon(width: u32, height: u32, pixel: [u8; 4]) -> Icon {
+        Icon { width, height, rgba: pixel.repeat((width * height) as usize) }
     }
 
     /// Leftmost column with anything in it, in logical pixels.
@@ -352,7 +510,13 @@ mod tests {
             summary: "Build finished".into(),
             body: "cargo build --release succeeded in 12.4s after a long enough run".into(),
             timeout: None,
+            icon: None,
         }
+    }
+
+    /// A copy of the sample with an icon on it, which is what every icon test starts from.
+    fn with_icon(icon: Icon) -> Notification {
+        Notification { icon: Some(icon), ..sample() }
     }
 
     #[test]
@@ -512,9 +676,10 @@ mod tests {
             summary: "s".into(),
             body: "wrapping words ".repeat(400),
             timeout: None,
+            icon: None,
         };
         let mut buffer = build(&mut font_system, &Config::default(), &long);
-        assert_eq!(card_height(&mut font_system, &mut buffer), MAX_H);
+        assert_eq!(card_height(&mut font_system, &mut buffer, false), MAX_H);
     }
 
     #[test]
@@ -544,5 +709,178 @@ mod tests {
             canvas[near_top..near_top + 3].iter().all(|channel| *channel > 200),
             "a 3px white border paints over the panel edge"
         );
+    }
+
+    /// With no icon the layout is the one plush has always had: text at the padding, in
+    /// the full panel width.
+    #[test]
+    fn without_an_icon_the_text_gets_the_whole_panel() {
+        assert_eq!(text_x(false), PAD);
+        assert_eq!(text_width(false), PANEL_W as f32 - 2.0 * PAD);
+        assert_eq!(text_x(true), PAD + ICON + ICON_GAP);
+        assert_eq!(text_width(true), PANEL_W as f32 - 2.0 * PAD - ICON - ICON_GAP);
+    }
+
+    /// The icon goes in the slot, and the text is moved over with it. The icon here is
+    /// fully transparent, so what moves in the ink box is the text alone.
+    #[test]
+    fn an_icon_moves_the_text_over_by_the_slot() {
+        let invisible = solid_icon(8, 8, [0, 0, 0, 0]);
+        let plain = render_with(transparent(), sample(), 1.0);
+        let shifted = render_with(transparent(), with_icon(invisible), 1.0);
+
+        let (left, ..) = inked_box(&plain.0, plain.1, plain.2).expect("text");
+        let (moved, ..) = inked_box(&shifted.0, shifted.1, shifted.2).expect("text");
+
+        assert_eq!(moved - left, (ICON + ICON_GAP) as usize, "the text clears the slot");
+    }
+
+    /// A narrower column of text wraps sooner, which is the other half of the layout.
+    ///
+    /// The words are short on purpose: a wrap point only moves when the next word no
+    /// longer fits, and long words make the two widths land on the same one.
+    #[test]
+    fn text_wraps_narrower_beside_an_icon() {
+        let long = Notification {
+            id: 2,
+            app_name: String::new(),
+            summary: "s".into(),
+            body: "word ".repeat(40),
+            timeout: None,
+            icon: None,
+        };
+        let plain = render_with(Config::default(), long.clone(), 1.0);
+        let beside = render_with(
+            Config::default(),
+            Notification { icon: Some(solid_icon(8, 8, [255, 0, 0, 255])), ..long },
+            1.0,
+        );
+
+        assert!(
+            beside.2 > plain.2,
+            "the same body needs more lines beside an icon: {} against {}",
+            beside.2,
+            plain.2
+        );
+    }
+
+    /// The slot is drawn where the text was moved from, and in the icon's own colour.
+    #[test]
+    fn the_icon_is_drawn_in_the_slot_beside_the_text() {
+        let (canvas, width, height) = render_with(transparent(), with_icon(solid_icon(64, 64, [255, 0, 0, 255])), 1.0);
+        let (w, h) = (width as usize, height as usize);
+        let (_, right, top, bottom) = inked_box(&canvas, width, height).expect("ink");
+
+        // The canvas is B,G,R,A after the swap, so a red icon is blue at index 0.
+        let centre = ((top + bottom) / 2 * w + PAD as usize + 16) * 4;
+        assert!(canvas[centre + 2] > 200, "the slot holds the icon");
+        assert!(canvas[centre] < 60, "in the icon's colour, not the panel's");
+        assert!(right > PAD as usize + 32, "and the text follows it");
+        assert!(h > (ICON + 2.0 * PAD) as usize, "the panel is tall enough for both");
+    }
+
+    /// The icon is centred in the panel, however tall the panel is for the text.
+    #[test]
+    fn the_icon_is_centred_vertically_in_the_panel() {
+        let (canvas, width, height) = render_with(transparent(), with_icon(solid_icon(32, 32, [255, 0, 0, 255])), 1.0);
+        let (w, h) = (width as usize, height as usize);
+        let top = (height - 32) / 2;
+
+        let slot = |y: usize| (y * w + PAD as usize + 16) * 4;
+        assert!(canvas[slot(top as usize) + 2] > 200, "the slot starts where it should");
+        assert!(canvas[slot(top as usize + 31) + 2] > 200, "and ends where it should");
+        assert_eq!(canvas[slot(top as usize - 1) + 3], 0, "nothing above the slot");
+        assert_eq!(canvas[slot((top + 32) as usize) + 3], 0, "nothing below it");
+        assert!(h >= (ICON + 2.0 * PAD) as usize);
+    }
+
+    /// A wide icon is scaled to the slot's width, and not stretched to its height.
+    #[test]
+    fn a_wide_icon_keeps_its_aspect_ratio() {
+        let mut bare = with_icon(solid_icon(128, 32, [255, 0, 0, 255]));
+        bare.app_name = String::new();
+        bare.summary = String::new();
+        bare.body = String::new();
+        let (canvas, width, height) = render_with(transparent(), bare, 1.0);
+
+        let (left, right, top, bottom) = inked_box(&canvas, width, height).expect("the icon");
+        let (drawn_w, drawn_h) = (right - left + 1, bottom - top + 1);
+        assert!((31..=33).contains(&drawn_w), "a 128x32 icon is drawn 32 wide, got {drawn_w}");
+        assert!((7..=9).contains(&drawn_h), "and 8 tall, not stretched: got {drawn_h}");
+        assert_eq!(left, PAD as usize, "starting at the padding");
+    }
+
+    /// A one-line notification is taller with an icon, because the slot and its padding
+    /// are taller than the minimum panel.
+    #[test]
+    fn a_short_notification_with_an_icon_is_tall_enough_for_the_slot() {
+        let mut one_line = sample();
+        one_line.app_name = String::new();
+        one_line.summary = "One line".into();
+        one_line.body = String::new();
+
+        let plain = render_with(Config::default(), one_line.clone(), 1.0);
+        let icon = render_with(
+            Config::default(),
+            Notification { icon: Some(solid_icon(8, 8, [255, 0, 0, 255])), ..one_line },
+            1.0,
+        );
+
+        assert_eq!(plain.2, MIN_H, "a one-line panel is still the minimum height");
+        assert_eq!(icon.2, (ICON + 2.0 * PAD) as u32, "and taller with an icon");
+    }
+
+    /// The line spans the panel between the corners when nothing has elapsed, shortens
+    /// from its fixed left end, and is not there at all when the timeout is up.
+    #[test]
+    fn the_countdown_line_drains_from_the_left() {
+        let full = render_countdown(transparent(), Some(1.0));
+        let half = render_countdown(transparent(), Some(0.5));
+        let gone = render_countdown(transparent(), Some(0.0));
+
+        let (left, right, top, bottom) = inked_box(&full.0, full.1, full.2).expect("the line");
+        assert_eq!(left, RADIUS as usize, "the line starts inside one corner");
+        assert_eq!(right, full.1 as usize - RADIUS as usize - 1, "and ends inside the other");
+        assert_eq!(bottom - top + 1, COUNTDOWN_H as usize, "and is a hairline");
+
+        let (half_left, half_right, ..) = inked_box(&half.0, half.1, half.2).expect("the line");
+        assert_eq!(half_left, left, "the left end never moves");
+        assert!(half_right < right, "half the timeout is a shorter line");
+        assert_eq!(inked_box(&gone.0, gone.1, gone.2), None, "and no line once it is up");
+    }
+
+    /// A panel that never expires has no line to draw.
+    #[test]
+    fn a_panel_with_no_timeout_has_no_countdown_line() {
+        let (canvas, width, height) = render_countdown(transparent(), None);
+        assert_eq!(inked_box(&canvas, width, height), None, "nothing is drawn");
+    }
+
+    /// The line is inside the panel: above the bottom border, and not over the corners it
+    /// would otherwise paint across.
+    #[test]
+    fn the_countdown_line_keeps_inside_the_panel() {
+        let plain = render_countdown(Config::default(), None);
+        let lined = render_countdown(Config::default(), Some(1.0));
+        let (w, h) = (lined.1 as usize, lined.2 as usize);
+
+        let mut rows: Vec<usize> = plain
+            .0
+            .chunks_exact(4)
+            .zip(lined.0.chunks_exact(4))
+            .enumerate()
+            .filter(|(_, (before, after))| before != after)
+            .map(|(pixel, _)| pixel / w)
+            .collect();
+        rows.dedup();
+        let top = h - Config::default().border.width as usize - COUNTDOWN_H as usize;
+        assert_eq!(rows, vec![top, top + 1], "the line sits above the border");
+
+        for (x, y) in [(0usize, h - 1), (w - 1, h - 1), (0, 0), (w - 1, 0)] {
+            assert!(
+                lined.0[(y * w + x) * 4 + 3] < 40,
+                "corner ({x},{y}) must stay rounded away"
+            );
+        }
     }
 }
