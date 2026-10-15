@@ -82,7 +82,7 @@ place, in which case the bus starts the daemon first and there is then nothing t
 
 | | |
 |---|---|
-| Position | `top-right` by default; 16 px from the edges it is anchored to |
+| Position | `top-right` by default; 16 px inside the edge it is anchored to, and clear of anything a bar or a dock has claimed there |
 | Panel | 380 px wide, 14 px corner radius, 16 px padding |
 | Icon | the `image-data` hint, fitted into a 32 px slot to the left of the text and never enlarged; `image-path` and `app_icon` are ignored |
 | Stack | up to 4 panels, 10 px apart, newest on top |
@@ -130,6 +130,12 @@ whatever is behind it.
 The stack is measured from the edges the position names, 16 px in, and grows away from them:
 a top position stacks downwards and a bottom one upwards. The centred columns are anchored
 to no side at all, which is what makes the compositor centre them horizontally.
+
+Those edges are the edges of the space the compositor leaves free, not of the screen. A panel
+claims no space for itself and asks to be moved clear of whatever has already claimed some, so on
+an output with a 32 px bar the first panel of a top position starts 48 px down, and a maximized
+window still covers the whole output underneath it. The compositor is the one that knows, and it
+keeps the panel against the boundary when the bar is hidden, shown or resized.
 
 A panel arrives from the edge its position is nearest, so the direction follows the corner:
 
@@ -196,6 +202,11 @@ about twenty times a second while its countdown line drains, with or without ani
 
 ## Deliberately not implemented
 
+- No avoidance of a surface that reserves nothing: placement follows the space the compositor has
+  left free, and `zwlr_layer_shell_v1` reports no geometry of any other client, so a bar that never
+  asks for an exclusive zone can still be covered. A bar anchored to a corner only is in the same
+  group: the protocol treats a positive zone on a corner anchor as zero, so it reserves nothing
+  either.
 - No configuration beyond the position, the border, the background, the font and the
   animation toggle. Panel width, padding, corner radius, the stack limit, the text colours,
   the icon size and the countdown line are compile-time constants.
@@ -263,6 +274,18 @@ end, because `wl_shm`'s `Argb8888` is BGRA in memory while `tiny-skia` paints RG
 ## Verified
 
 - Builds and passes `cargo clippy --all-targets` with no warnings.
+- Panel placement is measured against a headless sway with a `swaybar` on top: the panel's top
+  edge lands at the bar's height plus 16 px, follows the bar when it is removed, restored or made
+  taller, and is still created exactly once for the whole run — one `get_layer_surface` in the
+  protocol trace — so nothing is re-created to move it. The arrangement that makes this work was
+  read from the source of all three compositors this runs on (sway's `arrange_layers`, river's
+  `LayerShellOutput`, niri's smithay `LayerMap`). sway and river 0.5 with `tailrace` were measured;
+  niri could not be started on the machine this was measured on (no headless backend, no DRM
+  device), so its half rests on that reading.
+- The same session checks what a panel does not do: with four panels on screen a maximized window
+  still covers the full output underneath them, and `bottom-right` and `top-center` are unmoved —
+  the first 16 px off the bottom of the free area with its stack 10 px apart, the second centred
+  horizontally on the output.
 - End-to-end against a headless sway: `notify-send`, `replaces_id` replacement,
   `CloseNotification`, and timeout expiry all behave, with zero `wl_display` errors in the
   Wayland protocol trace.

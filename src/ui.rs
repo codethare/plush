@@ -334,8 +334,9 @@ impl Ui {
             None,
         );
         card.set_anchor(anchor(self.config.panel.position));
-        // -1: never reserve space, so windows may use the full screen under us.
-        card.set_exclusive_zone(-1);
+        // 0: be moved clear of anything that has claimed space, such as a bar, and claim
+        // none ourselves, so windows may use the full screen under us.
+        card.set_exclusive_zone(0);
         card.set_keyboard_interactivity(KeyboardInteractivity::None);
         card.set_size(render::PANEL_W, height);
         // An initial commit with no buffer; the configure it triggers is what draws.
