@@ -6,8 +6,8 @@
 
 use cosmic_text::{Attrs, Buffer, FontSystem, Shaping, SwashCache, SwashContent, SwashImage};
 use tiny_skia::{
-    Color, FillRule, FilterQuality, Paint, Path, PathBuilder, Pattern, PixmapMut, PixmapRef,
-    SpreadMode, Stroke, Transform,
+    Color, FillRule, FilterQuality, GradientStop, LinearGradient, Paint, Path, PathBuilder,
+    Pattern, PixmapMut, PixmapRef, Point, SpreadMode, Stroke, Transform,
 };
 
 use crate::{
@@ -22,8 +22,31 @@ pub const MAX_H: u32 = 320;
 /// Cards kept on screen. Older ones fall off the stack.
 pub const MAX_CARDS: usize = 4;
 
+/// Space reserved around the panel for its drop shadow, in logical pixels. The buffer
+/// and the layer surface grow by it; the panel keeps its size and screen position.
+pub const SHADOW: u32 = 24;
+
+/// The surface a panel of `w`×`h` needs: the panel plus its shadow margin on every side.
+/// The only place that ratio is defined, so the buffer, the layer surface and the input
+/// region cannot drift apart.
+pub const fn surface(w: u32, h: u32) -> (u32, u32) {
+    (w + 2 * SHADOW, h + 2 * SHADOW)
+}
+
+/// Shadow layers as (blur radius, alpha at the panel edge, vertical offset), logical px
+/// and 0-255. A tight contact shadow under a wide ambient one; the offset is positive
+/// because the light comes from above.
+const SHADOW_TIGHT: (u32, u32, u32) = (7, 170, 2);
+const SHADOW_WIDE: (u32, u32, u32) = (17, 130, 6);
+// The margin must fit the widest layer, or its falloff is cut off at the buffer edge.
+const _: () = assert!(SHADOW >= SHADOW_WIDE.0 + SHADOW_WIDE.2);
+
+/// The hairline's dark underside. Its lit half is the configured border colour, faded
+/// over the height.
+const BORDER_DARK_ALPHA: u32 = 60;
+
 const PAD: f32 = 16.0;
-const RADIUS: f32 = 14.0;
+const RADIUS: f32 = 12.0;
 const MIN_H: u32 = 60;
 /// The icon slot, and the space between it and the text.
 const ICON: f32 = 32.0;
@@ -144,7 +167,22 @@ pub fn paint(
     let pixels = &mut canvas[..width as usize * height as usize * 4];
     let progress = progress.clamp(0.0, 1.0);
 
-    // A panel travels its own side, so at progress 0 it sits entirely outside the buffer.
+    panel(pixels, width, height, config);
+    if let Some(image) = icon {
+        draw_icon(pixels, width, height, image);
+    }
+    if let Some(remaining) = remaining {
+        countdown(pixels, width, height, config, remaining);
+    }
+    text(pixels, width, height, font_system, swash, buffer, icon.is_some());
+    // wl_shm's Argb8888 is BGRA in memory on little-endian; tiny-skia draws RGBA.
+    for pixel in pixels.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
+    }
+
+    // The card travels its own side, so at progress 0 it sits entirely outside the buffer.
+    // It is drawn at rest inside its shadow margin and then slid out: chrome, text and all
+    // move together, and what leaves the buffer is clipped at the edge.
     let edge = config.panel.position.edge();
     let travel = (1.0 - progress)
         * match edge {
@@ -157,19 +195,7 @@ pub fn paint(
         Edge::Top => (0.0, -travel),
         Edge::Bottom => (0.0, travel),
     };
-
-    panel(pixels, width, height, config, dx, dy);
-    if let Some(image) = icon {
-        draw_icon(pixels, width, height, image, dx, dy);
-    }
-    if let Some(remaining) = remaining {
-        countdown(pixels, width, height, config, remaining, dx, dy);
-    }
-    text(pixels, width, height, font_system, swash, buffer, icon.is_some(), dx, dy);
-    // wl_shm's Argb8888 is BGRA in memory on little-endian; tiny-skia draws RGBA.
-    for pixel in pixels.chunks_exact_mut(4) {
-        pixel.swap(0, 2);
-    }
+    shift(pixels, width, height, dx.round() as i32, dy.round() as i32);
     // The buffer is premultiplied, so fading it means scaling every channel alike.
     if progress < 1.0 {
         let alpha = (progress * 255.0) as u32;
@@ -181,19 +207,30 @@ pub fn paint(
     }
 }
 
-fn panel(pixels: &mut [u8], width: u32, height: u32, config: &Config, dx: f32, dy: f32) {
+/// The card's chrome: the two shadow layers outside the panel, then its translucent
+/// body and the hairline that joins the body to the shadow.
+fn panel(pixels: &mut [u8], width: u32, height: u32, config: &Config) {
+    pixels.fill(0);
+
+    let margin = SHADOW;
+    let x = margin as f32;
+    let (w, h) = (width as f32 - 2.0 * x, height as f32 - 2.0 * x);
+    shadow(
+        pixels,
+        width,
+        height,
+        &Panel { x: margin, y: margin, w: w as u32, h: h as u32, r: RADIUS as u32 },
+    );
+
     let Some(mut pixmap) = PixmapMut::from_bytes(pixels, width, height) else {
         return;
     };
-    pixmap.fill(Color::TRANSPARENT);
-
-    let (w, h) = (width as f32, height as f32);
     let background = config.background.color;
     let mut fill = Paint::default();
     fill.set_color_rgba8(background.0, background.1, background.2, background.3);
     fill.anti_alias = true;
     pixmap.fill_path(
-        &rounded_rect(dx, dy, w, h, RADIUS),
+        &rounded_rect(x, x, w, h, RADIUS),
         &fill,
         FillRule::Winding,
         Transform::identity(),
@@ -201,36 +238,256 @@ fn panel(pixels: &mut [u8], width: u32, height: u32, config: &Config, dx: f32, d
     );
 
     let stroke_width = config.border.width;
-    // Zero means no border, and tiny-skia would draw a one-pixel hairline for it
+    // Zero means no hairline, and tiny-skia would draw a one-pixel stroke for it
     // anyway. A stroke at least as wide as the panel would invert the inset path.
     if stroke_width <= 0.0 || stroke_width >= w.min(h) {
         return;
     }
 
-    // Inset by half the stroke so the whole border lands inside the panel.
-    let border = config.border.color;
-    let mut edge = Paint::default();
-    edge.set_color_rgba8(border.0, border.1, border.2, border.3);
-    edge.anti_alias = true;
+    // Inset by half the stroke so the whole hairline lands inside the panel.
     let inset = stroke_width / 2.0;
-    pixmap.stroke_path(
-        &rounded_rect(
-            dx + inset,
-            dy + inset,
-            w - stroke_width,
-            h - stroke_width,
-            RADIUS - inset,
-        ),
-        &edge,
-        &Stroke { width: stroke_width, ..Stroke::default() },
-        Transform::identity(),
-        None,
+    let ring = rounded_rect(
+        x + inset,
+        x + inset,
+        w - stroke_width,
+        h - stroke_width,
+        RADIUS - inset,
     );
+    let hairline = Stroke { width: stroke_width, ..Stroke::default() };
+
+    // Dark underneath first, then the lit top: it covers the seam where the translucent
+    // body meets the shadow, so the two read as one continuous edge.
+    let mut dark = Paint::default();
+    dark.set_color_rgba8(0, 0, 0, BORDER_DARK_ALPHA as u8);
+    dark.anti_alias = true;
+    pixmap.stroke_path(&ring, &dark, &hairline, Transform::identity(), None);
+
+    // Lit from above and fading out over the height, so the shadow reads as growing out
+    // of the top edge rather than ringing the panel evenly.
+    let ink = config.border.color;
+    let stop = |offset: f32| {
+        let lit = (1.0 - offset).powi(2);
+        GradientStop::new(
+            offset,
+            Color::from_rgba8(ink.0, ink.1, ink.2, (ink.3 as f32 * lit).round() as u8),
+        )
+    };
+    let Some(shader) = LinearGradient::new(
+        Point::from_xy(0.0, x),
+        Point::from_xy(0.0, x + h),
+        vec![stop(0.0), stop(1.0 / 3.0), stop(2.0 / 3.0), stop(1.0)],
+        SpreadMode::Pad,
+        Transform::identity(),
+    ) else {
+        return;
+    };
+    let lit = Paint { shader, anti_alias: true, ..Paint::default() };
+    pixmap.stroke_path(&ring, &lit, &hairline, Transform::identity(), None);
+}
+
+/// The panel inside the shadow margin: origin and size in buffer px, plus the rounded
+/// outline the shadow grows out of.
+struct Panel {
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    r: u32,
+}
+
+impl Panel {
+    /// Whole-pixel span `[x0, x1)` of panel-relative row `rel` in buffer coords.
+    fn span(&self, rel: u32) -> (u32, u32) {
+        let (x0, x1) = rounded_span(self.w, self.h, self.r, rel);
+        (self.x + x0, self.x + x1)
+    }
+}
+
+/// Both drop-shadow layers in one pass. They share the panel outline, so each pixel gets
+/// its alpha from both falloffs and is written once. The buffer arrives cleared, so only
+/// pixels the shadow touches are written.
+fn shadow(buf: &mut [u8], w: u32, h: u32, panel: &Panel) {
+    // (blur, vertical offset, alpha by squared distance)
+    let layers: [(u32, i64, Vec<u32>); 2] = [SHADOW_WIDE, SHADOW_TIGHT].map(|(blur, a0, offset)| {
+        let b = blur.max(1);
+        let offset = offset as i64;
+        let lut = (0..=b * b)
+            .map(|d2| {
+                // A blurred edge starts at half the peak and eases out: a ramp from the
+                // full value leaves a visible cusp where it begins.
+                let t = (d2 as f64).sqrt() / b as f64;
+                (a0 as f64 * 0.5 * (1.0 + (std::f64::consts::PI * t).cos())).round() as u32
+            })
+            .collect();
+        (b, offset, lut)
+    });
+    let reach = layers.iter().map(|l| l.0).max().unwrap_or(1);
+    // Alpha by horizontal distance, rebuilt per row: the two falloffs are combined once
+    // per column distance instead of once per shadow pixel.
+    let mut band = vec![0u8; reach as usize + 1];
+    // Rows inside the panel all share dv = 0, so the band is usually built once.
+    let mut cached = [u32::MAX; 2];
+
+    for by in 0..h {
+        let y = by as i64;
+        // Per layer: squared row distance from the shifted body, clamped to the layer's
+        // blur (the offset is what hangs the shadow below the panel).
+        let dv: [u32; 2] = [0, 1].map(|k| {
+            let (b, offset, _) = &layers[k];
+            let top = panel.y as i64 + *offset;
+            let bottom = top + panel.h as i64;
+            let d = if y < top {
+                top - y
+            } else if y >= bottom {
+                y - bottom + 1
+            } else {
+                0
+            };
+            let d = d.min(*b as i64) as u32;
+            d * d
+        });
+        if !(0..2).any(|k| dv[k] < layers[k].0 * layers[k].0) {
+            continue;
+        }
+        // The outline row comes from the body itself, not from the offset shape: both
+        // layers must see the same span, or their falloffs leave a stripe where one
+        // starts further out than the other.
+        let rel = (y - panel.y as i64).clamp(0, panel.h as i64 - 1) as u32;
+        let (x0, x1) = panel.span(rel);
+        let start = x0.saturating_sub(reach);
+        let end = (x1 + reach).min(w);
+        if dv != cached {
+            cached = dv;
+            for (dx, out) in band.iter_mut().enumerate() {
+                let dx2 = (dx * dx) as u32;
+                let mut a = 0u32;
+                for (k, (b, _, lut)) in layers.iter().enumerate() {
+                    let la = lut[(dx2 + dv[k]).min(b * b) as usize];
+                    a = la + div255(a * (255 - la));
+                }
+                *out = a as u8;
+            }
+        }
+        // Two bands outside the outline; the body itself is painted later, so it is
+        // stepped over rather than tested per pixel.
+        if by >= panel.y && by < panel.y + panel.h {
+            put_band(buf, w, by, start..x0.min(end), (x0, x1), Side::Left, &band);
+            put_band(buf, w, by, x1.max(start)..end, (x0, x1), Side::Right, &band);
+        } else {
+            put_band(buf, w, by, start..end, (x0, x1), Side::Row, &band);
+        }
+    }
+}
+
+/// Which part of an outline row a shadow band covers.
+#[derive(Clone, Copy)]
+enum Side {
+    Left,
+    Right,
+    /// The whole row: the body is not there, so the middle is shadow too.
+    Row,
+}
+
+/// Writes one row's shadow band: premultiplied black, so only the alpha byte.
+fn put_band(
+    buf: &mut [u8],
+    w: u32,
+    by: u32,
+    xs: std::ops::Range<u32>,
+    (x0, x1): (u32, u32),
+    side: Side,
+    band: &[u8],
+) {
+    for x in xs {
+        let dx = match side {
+            Side::Left => x0 - 1 - x,
+            Side::Right => x - x1,
+            Side::Row if x < x0 => x0 - 1 - x,
+            Side::Row if x >= x1 => x - x1,
+            Side::Row => 0,
+        };
+        let a = band[(dx as usize).min(band.len() - 1)];
+        let dst = &mut buf[((by * w + x) * 4) as usize..][..4];
+        dst.copy_from_slice(&[0, 0, 0, a]);
+    }
+}
+
+/// Horizontal pixel span `[x0, x1)` of the rounded panel at row `y` (x0 inclusive, x1
+/// exclusive). Corner pixels fall outside the span; middle rows span the full width.
+fn rounded_span(w: u32, h: u32, r: u32, y: u32) -> (u32, u32) {
+    if y >= h {
+        return (0, 0);
+    }
+    let inset = rounded_inset(w, h, r, y).ceil() as u32;
+    (inset.min(w), w.saturating_sub(inset))
+}
+
+/// Fractional horizontal inset of the rounded outline at row `y`.
+fn rounded_inset(w: u32, h: u32, r: u32, y: u32) -> f64 {
+    let r = r.min(w / 2).min(h / 2);
+    if r == 0 || y >= h {
+        return 0.0;
+    }
+    let rr = (r * r) as f64;
+    let py = y as f64 + 0.5;
+    let top = r as f64;
+    let bottom = h as f64 - r as f64;
+    if py >= top && py <= bottom {
+        return 0.0;
+    }
+    let dy = if py < top { top - py } else { py - bottom };
+    r as f64 - (rr - dy * dy).max(0.0).sqrt()
+}
+
+fn div255(x: u32) -> u32 {
+    (x + 1 + (x >> 8)) >> 8
+}
+
+/// Moves the whole frame by `(dx, dy)` buffer pixels, leaving transparent behind. The card
+/// slides out of its own surface, so whatever leaves the buffer is clipped away.
+fn shift(pixels: &mut [u8], width: u32, height: u32, dx: i32, dy: i32) {
+    let (w, h) = (width as i32, height as i32);
+    if dy >= h || dy <= -h {
+        pixels.fill(0);
+        return;
+    }
+    // Rows first: whole rows move, then the rows they leave are blanked.
+    let pitch = w as usize * 4;
+    let (src, dst) = match dy {
+        1.. => (0..pixels.len() - dy as usize * pitch, dy as usize * pitch),
+        ..=-1 => ((-dy) as usize * pitch..pixels.len(), 0),
+        0 => (0..pixels.len(), 0),
+    };
+    pixels.copy_within(src, dst);
+    let blanked = match dy {
+        1.. => 0..dy as usize * pitch,
+        ..=-1 => pixels.len() - (-dy) as usize * pitch..pixels.len(),
+        0 => 0..0,
+    };
+    pixels[blanked].fill(0);
+
+    for y in 0..h {
+        let row = &mut pixels[y as usize * pitch..(y as usize + 1) * pitch];
+        match dx {
+            dx if dx >= w || dx <= -w => row.fill(0),
+            dx if dx > 0 => {
+                let gap = dx as usize * 4;
+                row.copy_within(0..pitch - gap, gap);
+                row[..gap].fill(0);
+            }
+            dx if dx < 0 => {
+                let gap = (-dx) as usize * 4;
+                row.copy_within(gap..pitch, 0);
+                row[pitch - gap..].fill(0);
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Draws the icon in its slot: scaled to fit, never enlarged, and centred vertically in
 /// the panel. The scaling is a shader, so there is no resampler to keep correct here.
-fn draw_icon(pixels: &mut [u8], width: u32, height: u32, image: &Icon, dx: f32, dy: f32) {
+fn draw_icon(pixels: &mut [u8], width: u32, height: u32, image: &Icon) {
     let Some(mut pixmap) = PixmapMut::from_bytes(pixels, width, height) else {
         return;
     };
@@ -240,7 +497,8 @@ fn draw_icon(pixels: &mut [u8], width: u32, height: u32, image: &Icon, dx: f32, 
 
     let scale = (ICON / image.width as f32).min(ICON / image.height as f32).min(1.0);
     let (w, h) = (image.width as f32 * scale, image.height as f32 * scale);
-    let (x, y) = (PAD + dx, (height as f32 - h) / 2.0 + dy);
+    // The panel is centred in its buffer, so the slot is centred the same way.
+    let (x, y) = (SHADOW as f32 + PAD, (height as f32 - h) / 2.0);
 
     let paint = Paint {
         shader: Pattern::new(
@@ -284,8 +542,6 @@ fn countdown(
     height: u32,
     config: &Config,
     remaining: f32,
-    dx: f32,
-    dy: f32,
 ) {
     if remaining <= 0.0 {
         return;
@@ -294,8 +550,9 @@ fn countdown(
         return;
     };
 
-    let span = (width as f32 - 2.0 * RADIUS) * remaining.min(1.0);
-    let y = height as f32 - config.border.width - COUNTDOWN_H;
+    let margin = SHADOW as f32;
+    let span = (width as f32 - 2.0 * margin - 2.0 * RADIUS) * remaining.min(1.0);
+    let y = height as f32 - margin - config.border.width - COUNTDOWN_H;
     let mut ink = Paint::default();
     ink.set_color_rgba8(
         COUNTDOWN_INK.0,
@@ -305,7 +562,7 @@ fn countdown(
     );
     ink.anti_alias = true;
     pixmap.fill_path(
-        &rect(RADIUS + dx, y + dy, span, COUNTDOWN_H),
+        &rect(margin + RADIUS, y, span, COUNTDOWN_H),
         &ink,
         FillRule::Winding,
         Transform::identity(),
@@ -322,16 +579,18 @@ fn text(
     swash: &mut SwashCache,
     buffer: &mut Buffer,
     has_icon: bool,
-    dx: f32,
-    dy: f32,
 ) {
+    let margin = SHADOW as f32;
     buffer.shape_until_scroll(font_system, false);
     for run in buffer.layout_runs() {
         for glyph in run.glyphs {
             let Some(color) = glyph.color_opt else {
                 continue;
             };
-            let origin = glyph.physical((text_x(has_icon) + dx, PAD + dy + run.line_y), 1.0);
+            let origin = glyph.physical(
+                (margin + text_x(has_icon), margin + PAD + run.line_y),
+                1.0,
+            );
             let Some(image) = swash.get_image(font_system, origin.cache_key) else {
                 continue;
             };
@@ -432,11 +691,12 @@ mod tests {
         let has_icon = sample.icon.is_some();
         let mut buffer = build(&mut font_system, &config, &sample);
         let height = card_height(&mut font_system, &mut buffer, has_icon);
-        let mut canvas = vec![0u8; PANEL_W as usize * height as usize * 4];
+        let (width, height) = surface(PANEL_W, height);
+        let mut canvas = vec![0u8; width as usize * height as usize * 4];
         let mut swash = SwashCache::new();
         paint(
             &mut canvas,
-            PANEL_W,
+            width,
             height,
             &config,
             sample.icon.as_ref(),
@@ -446,19 +706,20 @@ mod tests {
             progress,
             None,
         );
-        (canvas, PANEL_W, height)
+        (canvas, width, height)
     }
 
     /// A panel with a countdown on it and no text, so the line is the only ink on it.
     fn render_countdown(config: Config, remaining: Option<f32>) -> (Vec<u8>, u32, u32) {
         let mut font_system = FontSystem::new();
         let mut buffer = Buffer::new(&mut font_system, config.font.body_metrics());
-        let mut canvas = vec![0u8; PANEL_W as usize * MIN_H as usize * 4];
+        let (width, height) = surface(PANEL_W, MIN_H);
+        let mut canvas = vec![0u8; width as usize * height as usize * 4];
         let mut swash = SwashCache::new();
         paint(
             &mut canvas,
-            PANEL_W,
-            MIN_H,
+            width,
+            height,
             &config,
             None,
             &mut font_system,
@@ -467,7 +728,7 @@ mod tests {
             1.0,
             remaining,
         );
-        (canvas, PANEL_W, MIN_H)
+        (canvas, width, height)
     }
 
     /// A panel with nothing in it but what is drawn on top of it, so an ink box is the
@@ -482,16 +743,26 @@ mod tests {
         Icon { width, height, rgba: pixel.repeat((width * height) as usize) }
     }
 
-    /// Leftmost column with anything in it, in logical pixels.
-    /// Bounding box of everything painted, as (left, right, top, bottom).
+    /// Bounding box of everything painted on the panel, in panel pixels, as
+    /// (left, right, top, bottom). The shadow margin around the panel is skipped, and so
+    /// is the shadow in the panel's corner notches (it is premultiplied black), so what it
+    /// measures is the content rather than the chrome.
     fn inked_box(canvas: &[u8], width: u32, height: u32) -> Option<(usize, usize, usize, usize)> {
         let (w, h) = (width as usize, height as usize);
+        let margin = SHADOW as usize;
         let mut found: Option<(usize, usize, usize, usize)> = None;
-        for y in 0..h {
-            for x in 0..w {
-                if canvas[(y * w + x) * 4 + 3] > 0 {
-                    let (left, right, top, bottom) = found.unwrap_or((usize::MAX, 0, usize::MAX, 0));
-                    found = Some((left.min(x), right.max(x), top.min(y), bottom.max(y)));
+        for y in margin..h - margin {
+            for x in margin..w - margin {
+                let pixel = &canvas[(y * w + x) * 4..][..4];
+                if pixel[3] > 0 && pixel[..3].iter().any(|channel| *channel > 0) {
+                    let (left, right, top, bottom) =
+                        found.unwrap_or((usize::MAX, 0, usize::MAX, 0));
+                    found = Some((
+                        left.min(x - margin),
+                        right.max(x - margin),
+                        top.min(y - margin),
+                        bottom.max(y - margin),
+                    ));
                 }
             }
         }
@@ -538,6 +809,45 @@ mod tests {
         );
     }
 
+    /// The panel floats inside its shadow margin: the body is inside, the shadow spills
+    /// out of it and fades, and the corners of the buffer stay empty.
+    #[test]
+    fn the_panel_sits_inside_a_soft_shadow() {
+        let (canvas, width, height) = render_with(Config::default(), sample(), 1.0);
+        let (w, h) = (width as usize, height as usize);
+        let mid = h / 2;
+        let alpha = |x: usize, y: usize| canvas[(y * w + x) * 4 + 3];
+
+        for (x, y) in [(0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1)] {
+            assert_eq!(alpha(x, y), 0, "corner ({x},{y}) must stay empty");
+        }
+
+        let body = alpha(SHADOW as usize + 2, mid);
+        assert!(body > 200, "the panel body is on the panel, alpha={body}");
+        let near = alpha(SHADOW as usize - 1, mid);
+        let far = alpha(SHADOW as usize - SHADOW_WIDE.0 as usize + 1, mid);
+        assert!((1..255).contains(&near), "just outside is shadow, alpha={near}");
+        assert!(near > far, "and it fades away from the panel: {near} then {far}");
+    }
+
+    /// The hairline is lit from above and dark underneath, so the translucent body and the
+    /// shadow read as one edge rather than two surfaces meeting.
+    #[test]
+    fn the_hairline_is_lit_from_above() {
+        let (canvas, width, height) = render_with(Config::default(), sample(), 1.0);
+        let (w, h) = (width as usize, height as usize);
+        let margin = SHADOW as usize;
+        let row = |y: usize| canvas[(y * w + w / 2) * 4];
+
+        let body = row(margin + 3);
+        let top = row(margin);
+        let bottom = row(h - margin - 1);
+        assert_ne!(top, body, "the top edge is a hairline, not the body");
+        assert_ne!(bottom, body, "and so is the bottom edge");
+        assert!(top > body, "lit from above: {top} against the body's {body}");
+        assert!(bottom < body, "and dark underneath: {bottom} against {body}");
+    }
+
     /// Guards the fontconfig trap where weight 600 for the generic sans family
     /// resolves to a serif CJK face whose missing space falls back to a colour
     /// emoji, leaving a seventeen-pixel hole in the title.
@@ -576,19 +886,20 @@ mod tests {
         let settled = render_with(Config::default(), sample(), 1.0);
         let halfway = render_with(Config::default(), sample(), 0.5);
 
-        let (last_col, last_row) = (settled.1 as usize - 1, settled.2 as usize - 1);
-        assert_eq!(
-            inked_box(&settled.0, settled.1, settled.2),
-            Some((0, last_col, 0, last_row)),
-            "a settled panel fills its buffer"
-        );
+        let (left, right, ..) = inked_box(&settled.0, settled.1, settled.2).expect("the panel");
+        assert_eq!((left, right), (0, PANEL_W as usize - 1), "a settled panel fills its panel");
 
-        let (left, right, ..) = inked_box(&halfway.0, halfway.1, halfway.2).expect("still visible");
+        let (half_left, half_right, ..) =
+            inked_box(&halfway.0, halfway.1, halfway.2).expect("still visible");
         assert!(
-            (150..200).contains(&left),
-            "half a slide in, the panel should sit about half a width right; left ink at {left}"
+            half_left > 100,
+            "half a slide in, the panel should sit about half a width right; left ink at {half_left}"
         );
-        assert_eq!(right, last_col, "and still be clipped against the right edge");
+        assert_eq!(
+            half_right,
+            PANEL_W as usize - 1,
+            "and it is clipped against the edge it slides to"
+        );
 
         assert!(
             ink(&halfway.0) < ink(&settled.0),
@@ -614,7 +925,10 @@ mod tests {
             let (canvas, width, height) = render_with(config, sample(), 0.5);
             let (left, right, top, bottom) =
                 inked_box(&canvas, width, height).unwrap_or_else(|| panic!("{name}: nothing painted"));
-            let (last_col, last_row) = (width as usize - 1, height as usize - 1);
+            let (last_col, last_row) = (
+                width as usize - 2 * SHADOW as usize - 1,
+                height as usize - 2 * SHADOW as usize - 1,
+            );
 
             match edge {
                 Edge::Left => {
@@ -695,8 +1009,9 @@ mod tests {
         // canvas is B,G,R,A after the swap
         assert_eq!(&canvas[centre..centre + 3], &[0, 0, 255], "opaque red background");
 
-        let near_top = (w + w / 2) * 4;
-        assert_eq!(&canvas[near_top..near_top + 3], &[0, 0, 255], "width 0 draws no border");
+        // Two pixels inside the panel's top edge, so the hairline is out of the way.
+        let near_top = ((SHADOW as usize + 2) * w + w / 2) * 4;
+        assert_eq!(&canvas[near_top..near_top + 3], &[0, 0, 255], "width 0 draws no hairline");
 
         let bordered: Config = toml::from_str(
             "[background]\ncolor = \"#ff0000ff\"\n\n[border]\nwidth = 3.0\ncolor = \"#ffffffff\"\n",
@@ -704,10 +1019,10 @@ mod tests {
         .unwrap();
         let (canvas, width, _) = render_with(bordered, sample(), 1.0);
         let w = width as usize;
-        let near_top = (w + w / 2) * 4;
+        let near_top = ((SHADOW as usize + 1) * w + w / 2) * 4;
         assert!(
             canvas[near_top..near_top + 3].iter().all(|channel| *channel > 200),
-            "a 3px white border paints over the panel edge"
+            "a 3px white hairline paints over the panel edge"
         );
     }
 
@@ -771,8 +1086,10 @@ mod tests {
         let (w, h) = (width as usize, height as usize);
         let (_, right, top, bottom) = inked_box(&canvas, width, height).expect("ink");
 
-        // The canvas is B,G,R,A after the swap, so a red icon is blue at index 0.
-        let centre = ((top + bottom) / 2 * w + PAD as usize + 16) * 4;
+        // The canvas is B,G,R,A after the swap, so a red icon is blue at index 0. The
+        // ink box is on the panel, which starts one shadow margin into the buffer.
+        let margin = SHADOW as usize;
+        let centre = ((top + bottom) / 2 + margin) * w * 4 + (PAD as usize + 16 + margin) * 4;
         assert!(canvas[centre + 2] > 200, "the slot holds the icon");
         assert!(canvas[centre] < 60, "in the icon's colour, not the panel's");
         assert!(right > PAD as usize + 32, "and the text follows it");
@@ -784,9 +1101,10 @@ mod tests {
     fn the_icon_is_centred_vertically_in_the_panel() {
         let (canvas, width, height) = render_with(transparent(), with_icon(solid_icon(32, 32, [255, 0, 0, 255])), 1.0);
         let (w, h) = (width as usize, height as usize);
-        let top = (height - 32) / 2;
+        let margin = SHADOW as usize;
+        let top = (height - 2 * SHADOW - 32) / 2;
 
-        let slot = |y: usize| (y * w + PAD as usize + 16) * 4;
+        let slot = |y: usize| ((y + margin) * w + PAD as usize + 16 + margin) * 4;
         assert!(canvas[slot(top as usize) + 2] > 200, "the slot starts where it should");
         assert!(canvas[slot(top as usize + 31) + 2] > 200, "and ends where it should");
         assert_eq!(canvas[slot(top as usize - 1) + 3], 0, "nothing above the slot");
@@ -826,8 +1144,16 @@ mod tests {
             1.0,
         );
 
-        assert_eq!(plain.2, MIN_H, "a one-line panel is still the minimum height");
-        assert_eq!(icon.2, (ICON + 2.0 * PAD) as u32, "and taller with an icon");
+        assert_eq!(
+            plain.2,
+            surface(PANEL_W, MIN_H).1,
+            "a one-line panel is still the minimum height"
+        );
+        assert_eq!(
+            icon.2,
+            surface(PANEL_W, (ICON + 2.0 * PAD) as u32).1,
+            "and taller with an icon"
+        );
     }
 
     /// The line spans the panel between the corners when nothing has elapsed, shortens
@@ -839,8 +1165,9 @@ mod tests {
         let gone = render_countdown(transparent(), Some(0.0));
 
         let (left, right, top, bottom) = inked_box(&full.0, full.1, full.2).expect("the line");
+        let panel_w = full.1 as usize - 2 * SHADOW as usize;
         assert_eq!(left, RADIUS as usize, "the line starts inside one corner");
-        assert_eq!(right, full.1 as usize - RADIUS as usize - 1, "and ends inside the other");
+        assert_eq!(right, panel_w - RADIUS as usize - 1, "and ends inside the other");
         assert_eq!(bottom - top + 1, COUNTDOWN_H as usize, "and is a hairline");
 
         let (half_left, half_right, ..) = inked_box(&half.0, half.1, half.2).expect("the line");
@@ -873,8 +1200,11 @@ mod tests {
             .map(|(pixel, _)| pixel / w)
             .collect();
         rows.dedup();
-        let top = h - Config::default().border.width as usize - COUNTDOWN_H as usize;
-        assert_eq!(rows, vec![top, top + 1], "the line sits above the border");
+        let top = h
+            - SHADOW as usize
+            - Config::default().border.width as usize
+            - COUNTDOWN_H as usize;
+        assert_eq!(rows, vec![top, top + 1], "the line sits above the hairline");
 
         for (x, y) in [(0usize, h - 1), (w - 1, h - 1), (0, 0), (w - 1, 0)] {
             assert!(

@@ -145,9 +145,11 @@ fn run_daemon() {
         .expect("plush: zwlr_layer_shell_v1 is unavailable (a wlroots compositor is required)");
     let shm = Shm::bind(&globals, &qh).expect("plush: wl_shm is unavailable");
 
-    // Room for a spare buffer per card. memfd pages stay uncommitted until a card
-    // actually paints them, so oversizing this costs address space, not memory.
-    let pool_size = render::PANEL_W as usize * render::MAX_H as usize * 4 * render::MAX_CARDS * 2;
+    // Room for a spare buffer per card, each the panel plus its shadow margin. memfd
+    // pages stay uncommitted until a card actually paints them, so oversizing this costs
+    // address space, not memory.
+    let (surface_w, surface_h) = render::surface(render::PANEL_W, render::MAX_H);
+    let pool_size = surface_w as usize * surface_h as usize * 4 * render::MAX_CARDS * 2;
     let pool = SlotPool::new(pool_size, &shm).expect("plush: could not create the shm pool");
 
     let mut event_loop: EventLoop<'static, ui::Ui> =

@@ -3,7 +3,7 @@
 # This file is the default. It is compiled into the binary and used whenever there is no
 # user configuration at $XDG_CONFIG_HOME/plush/config.toml, which is
 # ~/.config/plush/config.toml unless XDG_CONFIG_HOME has been moved. Copy it there to
-# change anything; the look below is the one plush has always had.
+# change anything; the look below is the default one.
 #
 # Every key is optional and every key below is shown at its default, so deleting a line
 # changes nothing. A file that is present but wrong is an error, not a silent fallback.
@@ -18,14 +18,15 @@
 position = "top-right"
 
 [border]
-# Stroke width in logical pixels. 0 draws no border.
+# Stroke width in logical pixels. 0 draws no hairline.
 width = 1.0
-# A hairline highlight, 10% white.
-color = "#ffffff1a"
+# The hairline's lit ink: solid along the top edge, fading out over the panel height,
+# over a fixed dark underside that joins it to the shadow.
+color = "#ffffff22"
 
 [background]
 # Dark "system" grey, translucent.
-color = "#1c1c1ed6"
+color = "#1e1e1ed4"
 
 [animation]
 # Slide and fade each panel in from the right, and back out when it goes away.

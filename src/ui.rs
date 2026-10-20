@@ -40,8 +40,10 @@ use crate::{
     render,
 };
 
-/// Distance from the screen edge, in logical pixels.
-const MARGIN: i32 = 16;
+/// Distance from the screen edge to the panel's visible edge, in logical pixels. The
+/// surface carries the panel's shadow margin on every side, so this has to clear it.
+const MARGIN: i32 = 32;
+const _: () = assert!(MARGIN >= render::SHADOW as i32);
 /// Space between stacked cards.
 const GAP: i32 = 10;
 /// One animation frame. 60 Hz, which is what the motion was tuned against.
@@ -68,18 +70,20 @@ fn anchor(position: Position) -> Anchor {
 /// Margins for a card `offset` pixels into the stack, in the order `set_margin` wants
 /// them: top, right, bottom, left.
 ///
-/// Only anchored edges take a margin, so a centred column has none on either side. The
-/// stack is measured from the anchored edge, which is why a bottom position stacks
-/// upwards from the bottom of the screen.
+/// The surface carries the shadow margin on every side, so an edge margin is the panel's
+/// visible gap to the screen edge minus that margin. Only anchored edges take a margin, so
+/// a centred column has none on either side. The stack is measured from the anchored edge,
+/// which is why a bottom position stacks upwards from the bottom of the screen.
 fn margins(position: Position, offset: i32) -> (i32, i32, i32, i32) {
+    let edge = MARGIN - render::SHADOW as i32;
     let (left, right) = match position.column() {
-        Column::Left => (MARGIN, 0),
+        Column::Left => (edge, 0),
         Column::Centre => (0, 0),
-        Column::Right => (0, MARGIN),
+        Column::Right => (0, edge),
     };
     let (top, bottom) = match position.row() {
-        Row::Top => (MARGIN + offset, 0),
-        Row::Bottom => (0, MARGIN + offset),
+        Row::Top => (edge + offset, 0),
+        Row::Bottom => (0, edge + offset),
     };
     (top, right, bottom, left)
 }
@@ -338,7 +342,9 @@ impl Ui {
         // none ourselves, so windows may use the full screen under us.
         card.set_exclusive_zone(0);
         card.set_keyboard_interactivity(KeyboardInteractivity::None);
-        card.set_size(render::PANEL_W, height);
+        // The surface carries the panel plus its shadow margin on every side.
+        let (surface_w, surface_h) = render::surface(render::PANEL_W, height);
+        card.set_size(surface_w, surface_h);
         // An initial commit with no buffer; the configure it triggers is what draws.
         card.commit();
 
@@ -794,20 +800,23 @@ mod tests {
 
     /// `set_margin` takes top, right, bottom, left. Only anchored edges get a margin, and
     /// the stack is measured from the anchored edge, so a bottom position grows upwards.
+    /// An edge margin is the panel's visible gap, less the shadow margin the surface
+    /// already carries.
     #[test]
     fn the_stack_starts_at_the_named_corner_and_grows_away_from_its_edge() {
-        assert_eq!(margins(Position::TopLeft, 0), (MARGIN, 0, 0, MARGIN));
-        assert_eq!(margins(Position::TopLeft, 50), (MARGIN + 50, 0, 0, MARGIN));
+        let edge = MARGIN - render::SHADOW as i32;
+        assert_eq!(margins(Position::TopLeft, 0), (edge, 0, 0, edge));
+        assert_eq!(margins(Position::TopLeft, 50), (edge + 50, 0, 0, edge));
 
-        assert_eq!(margins(Position::BottomLeft, 0), (0, 0, MARGIN, MARGIN));
-        assert_eq!(margins(Position::BottomLeft, 50), (0, 0, MARGIN + 50, MARGIN));
+        assert_eq!(margins(Position::BottomLeft, 0), (0, 0, edge, edge));
+        assert_eq!(margins(Position::BottomLeft, 50), (0, 0, edge + 50, edge));
 
-        assert_eq!(margins(Position::TopRight, 0), (MARGIN, MARGIN, 0, 0));
-        assert_eq!(margins(Position::BottomRight, 50), (0, MARGIN, MARGIN + 50, 0));
+        assert_eq!(margins(Position::TopRight, 0), (edge, edge, 0, 0));
+        assert_eq!(margins(Position::BottomRight, 50), (0, edge, edge + 50, 0));
 
         // A centred column is anchored to no side, so it takes no side margin.
-        assert_eq!(margins(Position::TopCenter, 0), (MARGIN, 0, 0, 0));
-        assert_eq!(margins(Position::BottomCenter, 7), (0, 0, MARGIN + 7, 0));
+        assert_eq!(margins(Position::TopCenter, 0), (edge, 0, 0, 0));
+        assert_eq!(margins(Position::BottomCenter, 7), (0, 0, edge + 7, 0));
     }
 
     /// A hold freezes the countdown; releasing it runs what was left, rather than the

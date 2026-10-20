@@ -92,14 +92,16 @@ impl<'de> Deserialize<'de> for FontWeight {
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Border {
-    /// Stroke width in logical pixels. `0` draws no border at all.
+    /// Stroke width in logical pixels. `0` draws no hairline at all.
     pub width: f32,
+    /// The hairline's lit ink: it is drawn solid at the top edge and fades out over the
+    /// panel height, over a fixed dark underside.
     pub color: Rgba,
 }
 
 impl Default for Border {
     fn default() -> Self {
-        Self { width: 1.0, color: Rgba(255, 255, 255, 26) }
+        Self { width: 1.0, color: Rgba(255, 255, 255, 34) }
     }
 }
 
@@ -111,7 +113,7 @@ pub struct Background {
 
 impl Default for Background {
     fn default() -> Self {
-        Self { color: Rgba(28, 28, 30, 214) }
+        Self { color: Rgba(30, 30, 30, 212) }
     }
 }
 
@@ -349,17 +351,16 @@ mod tests {
     }
 
     /// The bundled file is what runs when there is no user configuration, so it has to
-    /// reproduce exactly the look plush had before any of this was configurable: a 1px
-    /// white hairline, a translucent dark grey panel, and sans-serif at the original
-    /// sizes and weights.
+    /// reproduce the panel chrome exactly: a 1px hairline, a translucent dark grey panel
+    /// and sans-serif at the original sizes and weights.
     #[test]
-    fn the_bundled_default_is_the_original_look() {
+    fn the_bundled_default_is_the_panel_look() {
         let bundled: Config = toml::from_str(BUNDLED).expect("data/config.toml must parse");
         assert_eq!(bundled, Config::default(), "a missing key must match the bundled value");
 
         assert_eq!(bundled.border.width, 1.0);
-        assert_eq!(bundled.border.color, Rgba(255, 255, 255, 26));
-        assert_eq!(bundled.background.color, Rgba(28, 28, 30, 214));
+        assert_eq!(bundled.border.color, Rgba(255, 255, 255, 34));
+        assert_eq!(bundled.background.color, Rgba(30, 30, 30, 212));
         assert_eq!(bundled.font.family, "sans-serif");
         assert_eq!(bundled.font.app_metrics(), Metrics::new(11.0, 15.0));
         assert_eq!(bundled.font.title_metrics(), Metrics::new(14.0, 19.0));
@@ -428,7 +429,7 @@ mod tests {
         fs::write(&path, "[border]\nwidth = 7.0\n").unwrap();
         let config = load_from(&path).unwrap();
         assert_eq!(config.border.width, 7.0);
-        assert_eq!(config.background.color, Rgba(28, 28, 30, 214), "untouched keys stay default");
+        assert_eq!(config.background.color, Rgba(30, 30, 30, 212), "untouched keys stay default");
 
         fs::write(&path, "[border]\nwidth = \"thick\"\n").unwrap();
         let err = load_from(&path).unwrap_err();
