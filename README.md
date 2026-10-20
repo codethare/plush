@@ -82,8 +82,9 @@ place, in which case the bus starts the daemon first and there is then nothing t
 
 | | |
 |---|---|
-| Position | `top-right` by default; 16 px inside the edge it is anchored to, and clear of anything a bar or a dock has claimed there |
-| Panel | 380 px wide, 14 px corner radius, 16 px padding |
+| Position | `top-right` by default; 32 px inside the edge it is anchored to, and clear of anything a bar or a dock has claimed there; the drop shadow lives inside that gap |
+| Panel | 380 px wide, 12 px corner radius, 16 px padding, a hairline edge and a drop shadow |
+| Dense output | drawn at the output's integer scale, so the panel keeps its logical size and its pixels are the output's own; fractional scaling uses the integer scale the compositor reports |
 | Icon | the `image-data` hint, fitted into a 32 px slot to the left of the text and never enlarged; `image-path` and `app_icon` are ignored |
 | Stack | up to 4 panels, 10 px apart, newest on top |
 | Max height | 320 px; longer bodies are clipped |
@@ -102,8 +103,8 @@ place, in which case the bus starts the daemon first and there is then nothing t
 
 plush reads `$XDG_CONFIG_HOME/plush/config.toml`, which is `~/.config/plush/config.toml`
 unless `XDG_CONFIG_HOME` has been moved. **There is no need to create it:** with no user file
-plush runs the bundled `data/config.toml`, which is the look it has always had. Copy that file
-across only when you want to change something.
+plush runs the bundled `data/config.toml`, which is the default look. Copy that file across
+only when you want to change something.
 
 The file is optional, and so is every key in it: anything you leave out keeps the default shown
 below.
@@ -150,14 +151,14 @@ A panel arrives from the edge its position is nearest, so the direction follows 
 
 | Key | Default | |
 |---|---|---|
-| `width` | `1.0` | Stroke width in logical pixels. `0` draws no border. |
-| `color` | `"#ffffff1a"` | A 10% white highlight. |
+| `width` | `1.0` | Stroke width in buffer pixels, so the default stays one device pixel thin at any density. `0` draws no hairline. |
+| `color` | `"#ffffff22"` | The hairline's lit ink: solid along the top edge, fading out over the panel height over a fixed dark underside. |
 
 ### `[background]`
 
 | Key | Default | |
 |---|---|---|
-| `color` | `"#1c1c1ed6"` | A translucent dark grey. |
+| `color` | `"#1e1e1ed4"` | A translucent dark grey. |
 
 ### `[font]`
 
@@ -225,8 +226,8 @@ about twenty times a second while its countdown line drains, with or without ani
 - No hover highlight and no close button: the pointer holds a panel open and a press
   dismisses it, and that is all it does.
 - Corners are circular arcs, not Apple's continuous-curvature squircles.
-- Panels are positioned in logical pixels; output scale is not consulted, so a HiDPI
-  output gets a panel that is physically smaller.
+- Fractional scaling: panels are drawn at the integer scale the compositor reports, so a
+  1.25× or 1.5× output is rendered at 2× and scaled down there rather than natively.
 
 ## Design
 
@@ -250,6 +251,10 @@ Five consequences worth knowing:
 
 - **A panel is drawn only from `configure`.** The compositor's suggested size is the single
   source of truth for surface state, so a buffer can never be attached with stale geometry.
+- **A density change stops painting until the next `configure`.** Moving a card to an
+  output with a different scale resizes its surface and advertises the new density; a buffer
+  whose size disagrees with the configure size times that density is a protocol error, and the
+  compositor destroys the surface, so nothing is painted until the new size arrives.
 - **Replacing a notification rebuilds its surface.** A commit without a new buffer does not
   repaint, so a fresh surface is the reliable way to get a fresh `configure`.
 - **One `draw` serves both the compositor and the animation.** A card is painted from
@@ -291,6 +296,11 @@ end, because `wl_shm`'s `Argb8888` is BGRA in memory while `tiny-skia` paints RG
   Wayland protocol trace.
 - Panel pixels are covered by unit tests asserting the rounded corners, the opaque
   interior, and that a title never falls back to a second font mid-run.
+- The dense path is covered headless at 1× and 2×: the buffer doubles, the shadow margin
+  and corner radius double with it, the text is rasterised at the buffer density, the
+  hairline stays one physical pixel, and the height clamp doubles. The compositor side of
+  it — `set_buffer_scale`, the configure that follows, and where the pointer lands — is
+  not yet measured against a real HiDPI output.
 - Icons and the countdown line are covered by unit tests for the slot geometry, the aspect
   ratio, the vertical centring, the wrap width beside a slot, the length of the line against
   the timeout, and that neither is drawn without a hint or without a timeout — plus the

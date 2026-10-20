@@ -88,6 +88,26 @@ fn margins(position: Position, offset: i32) -> (i32, i32, i32, i32) {
     (top, right, bottom, left)
 }
 
+/// Sizes a card's surface to its panel and limits clicks to the panel itself.
+///
+/// The surface carries the shadow margin on every side, so the buffer — and the layer
+/// size the compositor is asked for, which is in surface-local pixels — is the panel plus
+/// that margin; only the panel rectangle takes input, or a press beside a notification
+/// would dismiss it (and, with cards stacked, swallow the press meant for the next one).
+fn size_card(compositor: &CompositorState, surface: &LayerSurface, height: u32) {
+    let (width, surface_height) = render::surface(render::PANEL_W, height);
+    surface.set_size(width, surface_height);
+
+    let region = Region::new(compositor).expect("plush: wl_compositor is bound");
+    region.add(
+        render::SHADOW as i32,
+        render::SHADOW as i32,
+        render::PANEL_W as i32,
+        height as i32,
+    );
+    surface.set_input_region(Some(region.wl_region()));
+}
+
 struct Card {
     id: u32,
     /// What this card was built from, so a `replaces_id` update is detected.
@@ -98,9 +118,13 @@ struct Card {
     /// leaving is gone from the queue but still being painted.
     icon: Option<Icon>,
     height: u32,
-    /// The size the compositor last configured. Animation redraws need it, which is
-    /// why a card cannot be painted before its first `configure`.
+    /// The size the compositor last configured, in surface-local (logical) pixels.
+    /// Animation redraws need it, which is why a card cannot be painted before its
+    /// first `configure`; `None` means one is on its way and nothing may be painted.
     size: Option<(u32, u32)>,
+    /// The output density this card is drawn at. One per card, because two monitors can
+    /// report different scales and a card belongs to the output it was placed on.
+    scale: u32,
     timeouts: Timeouts,
     anim: Anim,
 }
@@ -285,7 +309,7 @@ impl Ui {
                 Some(index) => ordered.push(self.cards.remove(index)),
                 None => {
                     self.cards.retain(|card| card.id != notification.id);
-                    ordered.push(self.make_card(notification));
+                    ordered.push(self.make_card(notification, 1));
                 }
             }
         }
@@ -324,11 +348,12 @@ impl Ui {
         self.arm_tick();
     }
 
-    fn make_card(&mut self, notification: &Notification) -> Card {
-        let has_icon = notification.icon.is_some();
-        let mut content = render::build(&mut self.font_system, &self.config, notification);
-        let height = render::card_height(&mut self.font_system, &mut content, has_icon);
-
+    /// Builds a card on a fresh surface at `scale`, the output density it will be drawn at.
+    ///
+    /// A buffer scale can only change together with a buffer of that density, and a buffer
+    /// can only be attached after a configure for it — so a card that moves to another
+    /// density is rebuilt here rather than patched, exactly like a replaced notification.
+    fn make_card(&mut self, notification: &Notification, scale: u32) -> Card {
         let surface = self.compositor.create_surface(&self.qh);
         let card = self.layer_shell.create_layer_surface(
             &self.qh,
@@ -337,26 +362,24 @@ impl Ui {
             Some("plush"),
             None,
         );
+        // Before the first commit, because a live surface never changes it. A wl_surface
+        // older than v3 cannot carry one: the buffer then stays 1:1 and the compositor
+        // upscales it, so the card has to be drawn at 1:1 to match.
+        let scale = match card.set_buffer_scale(scale) {
+            Ok(()) => scale.max(1),
+            Err(_) => 1,
+        };
+        let has_icon = notification.icon.is_some();
+        let mut content = render::build(&mut self.font_system, &self.config, scale, notification);
+        let height = render::card_height(&mut self.font_system, &mut content, has_icon, scale)
+            .div_ceil(scale);
+
         card.set_anchor(anchor(self.config.panel.position));
         // 0: be moved clear of anything that has claimed space, such as a bar, and claim
         // none ourselves, so windows may use the full screen under us.
         card.set_exclusive_zone(0);
         card.set_keyboard_interactivity(KeyboardInteractivity::None);
-        // The surface carries the panel plus its shadow margin on every side.
-        let (surface_w, surface_h) = render::surface(render::PANEL_W, height);
-        card.set_size(surface_w, surface_h);
-        // Only the panel takes clicks. The shadow margin belongs to the surface, but a
-        // press beside a notification must not dismiss it — with cards stacked, the
-        // margin of one would otherwise swallow presses meant for the one next to it.
-        let region =
-            Region::new(&self.compositor).expect("plush: wl_compositor is bound");
-        region.add(
-            render::SHADOW as i32,
-            render::SHADOW as i32,
-            render::PANEL_W as i32,
-            height as i32,
-        );
-        card.set_input_region(Some(region.wl_region()));
+        size_card(&self.compositor, &card, height);
         // An initial commit with no buffer; the configure it triggers is what draws.
         card.commit();
 
@@ -374,6 +397,7 @@ impl Ui {
                 Anim::Settled
             },
             size: None,
+            scale,
         }
     }
 
@@ -442,9 +466,13 @@ impl Ui {
     /// every buffer in the pool can be in flight at once — which the caller has to
     /// retry rather than treat as a finished animation.
     fn draw(&mut self, index: usize) -> bool {
-        let Some((width, height)) = self.cards[index].size else {
+        let Some((logical_w, logical_h)) = self.cards[index].size else {
             return false;
         };
+        // The configure size is surface-local; the buffer it is backed by is that times
+        // the density the card advertised with `set_buffer_scale`.
+        let scale = self.cards[index].scale;
+        let (width, height) = (logical_w * scale, logical_h * scale);
         let stride = width as i32 * 4;
         let Ok((buffer, canvas)) = self.pool.create_buffer(
             width as i32,
@@ -469,6 +497,7 @@ impl Ui {
             &mut card.content,
             card.anim.progress(now),
             remaining,
+            scale,
         );
 
         card.surface.wl_surface().damage_buffer(0, 0, width as i32, height as i32);
@@ -477,6 +506,50 @@ impl Ui {
         }
         card.surface.commit();
         true
+    }
+
+    /// Redraws one card at the density of the output it landed on: the surface it was
+    /// created on is replaced, so the compositor configures the new one at that density
+    /// before a single buffer is attached.
+    fn apply_scale(&mut self, surface: &wl_surface::WlSurface, scale: i32) {
+        let scale = scale.max(1) as u32;
+        let Some(index) = self
+            .cards
+            .iter()
+            .position(|card| card.surface.wl_surface() == surface)
+        else {
+            return;
+        };
+        let card = &self.cards[index];
+        // A card on its way out keeps the density it has for its last frames: it has been
+        // announced as closed and will not be repainted enough to be worth a new surface.
+        if card.scale == scale || card.anim.leaving() {
+            return;
+        }
+        let (id, timeouts, anim) = (card.id, card.timeouts, card.anim);
+        let Some(notification) = self
+            .store
+            .lock()
+            .unwrap()
+            .items
+            .iter()
+            .find(|notification| notification.id == id)
+            .cloned()
+        else {
+            return;
+        };
+
+        let mut card = self.make_card(&notification, scale);
+        // The new surface is the same card in the same place: it keeps its place in the
+        // stack, and what is left of its life. A hold does not survive, though: the
+        // pointer's events belong to the surface that just went away, so the countdown
+        // resumes and re-holds if the pointer is still on the panel.
+        card.timeouts = timeouts;
+        card.timeouts.release(Instant::now());
+        card.anim = anim;
+        self.cards[index] = card;
+
+        self.sync();
     }
 
     /// Keeps one frame timer alive while any card is moving.
@@ -608,9 +681,10 @@ impl CompositorHandler for Ui {
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        _surface: &wl_surface::WlSurface,
-        _new_factor: i32,
+        surface: &wl_surface::WlSurface,
+        new_factor: i32,
     ) {
+        self.apply_scale(surface, new_factor);
     }
 
     fn transform_changed(
@@ -635,9 +709,14 @@ impl CompositorHandler for Ui {
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        _surface: &wl_surface::WlSurface,
-        _output: &wl_output::WlOutput,
+        surface: &wl_surface::WlSurface,
+        output: &wl_output::WlOutput,
     ) {
+        let scale = self
+            .output_state
+            .info(output)
+            .map_or(1, |info| info.scale_factor);
+        self.apply_scale(surface, scale);
     }
 
     fn surface_leave(

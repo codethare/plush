@@ -68,13 +68,22 @@ fn text_x(has_icon: bool) -> f32 {
     PAD + if has_icon { ICON + ICON_GAP } else { 0.0 }
 }
 
-/// Shapes a notification into a wrapped, styled buffer.
-pub fn build(font_system: &mut FontSystem, config: &Config, notification: &Notification) -> Buffer {
+/// Shapes a notification into a wrapped, styled buffer, at the output's density.
+///
+/// `scale` is the buffer-to-logical density: the buffer and every metric here are in
+/// buffer pixels, so the layout wraps at the same words on a dense output.
+pub fn build(
+    font_system: &mut FontSystem,
+    config: &Config,
+    scale: u32,
+    notification: &Notification,
+) -> Buffer {
+    let density = scale.max(1) as f32;
     let font = &config.font;
-    let mut buffer = Buffer::new(font_system, font.body_metrics());
+    let mut buffer = Buffer::new(font_system, font.body_metrics().scale(density));
     buffer.set_size(
-        Some(text_width(notification.icon.is_some())),
-        Some(MAX_H as f32 - 2.0 * PAD),
+        Some(text_width(notification.icon.is_some()) * density),
+        Some((MAX_H as f32 - 2.0 * PAD) * density),
     );
 
     let mut parts: Vec<(String, Attrs)> = Vec::new();
@@ -83,7 +92,7 @@ pub fn build(font_system: &mut FontSystem, config: &Config, notification: &Notif
             notification.app_name.clone(),
             Attrs::new()
                 .family(font.family())
-                .metrics(font.app_metrics())
+                .metrics(font.app_metrics().scale(density))
                 .color(INK_TERTIARY)
                 .weight(font.app_weight.0),
         ));
@@ -92,7 +101,7 @@ pub fn build(font_system: &mut FontSystem, config: &Config, notification: &Notif
         notification.summary.clone(),
         Attrs::new()
             .family(font.family())
-            .metrics(font.title_metrics())
+            .metrics(font.title_metrics().scale(density))
             .color(INK_PRIMARY)
             .weight(font.title_weight.0),
     ));
@@ -101,7 +110,7 @@ pub fn build(font_system: &mut FontSystem, config: &Config, notification: &Notif
             notification.body.clone(),
             Attrs::new()
                 .family(font.family())
-                .metrics(font.body_metrics())
+                .metrics(font.body_metrics().scale(density))
                 .color(INK_SECONDARY)
                 .weight(font.body_weight.0),
         ));
@@ -120,23 +129,30 @@ pub fn build(font_system: &mut FontSystem, config: &Config, notification: &Notif
         .collect();
     buffer.set_rich_text(
         spans,
-        &Attrs::new().family(font.family()).metrics(font.body_metrics()),
+        &Attrs::new().family(font.family()).metrics(font.body_metrics().scale(density)),
         Shaping::Advanced,
         None,
     );
     buffer
 }
 
-/// Panel height needed by an already-`build`t buffer.
+/// Panel height in buffer pixels needed by an already-`build`t buffer.
 ///
 /// `has_icon` is passed in because the slot and its padding are taller than a one-line
 /// panel would otherwise be, so a short notification with an icon is taller than the same
 /// text without one.
-pub fn card_height(font_system: &mut FontSystem, buffer: &mut Buffer, has_icon: bool) -> u32 {
+pub fn card_height(
+    font_system: &mut FontSystem,
+    buffer: &mut Buffer,
+    has_icon: bool,
+    scale: u32,
+) -> u32 {
+    let density = scale.max(1);
+    let pad = PAD * density as f32;
     buffer.shape_until_scroll(font_system, false);
     let text: f32 = buffer.layout_runs().map(|run| run.line_height).sum();
-    let floor = if has_icon { (ICON + 2.0 * PAD) as u32 } else { 0 };
-    ((text + 2.0 * PAD).ceil() as u32).clamp(MIN_H.max(floor), MAX_H)
+    let floor = if has_icon { ((ICON + 2.0 * PAD) * density as f32) as u32 } else { 0 };
+    ((text + 2.0 * pad).ceil() as u32).clamp((MIN_H * density).max(floor), MAX_H * density)
 }
 
 /// Renders one panel into `canvas`.
@@ -151,6 +167,9 @@ pub fn card_height(font_system: &mut FontSystem, buffer: &mut Buffer, has_icon: 
 ///
 /// `remaining` is how much of the notification's timeout is left, which is the length of
 /// the countdown line; `None` for a notification that never expires, which has no line.
+///
+/// `scale` is the buffer-to-logical density: the buffer is `width`×`height` buffer pixels
+/// and every constant below is logical, so they are multiplied by it here.
 #[allow(clippy::too_many_arguments)]
 pub fn paint(
     canvas: &mut [u8],
@@ -163,18 +182,20 @@ pub fn paint(
     buffer: &mut Buffer,
     progress: f32,
     remaining: Option<f32>,
+    scale: u32,
 ) {
     let pixels = &mut canvas[..width as usize * height as usize * 4];
     let progress = progress.clamp(0.0, 1.0);
+    let density = scale.max(1);
 
-    panel(pixels, width, height, config);
+    panel(pixels, width, height, config, density);
     if let Some(image) = icon {
-        draw_icon(pixels, width, height, image);
+        draw_icon(pixels, width, height, image, density);
     }
     if let Some(remaining) = remaining {
-        countdown(pixels, width, height, config, remaining);
+        countdown(pixels, width, height, config, remaining, density);
     }
-    text(pixels, width, height, font_system, swash, buffer, icon.is_some());
+    text(pixels, width, height, font_system, swash, buffer, icon.is_some(), density);
     // wl_shm's Argb8888 is BGRA in memory on little-endian; tiny-skia draws RGBA.
     for pixel in pixels.chunks_exact_mut(4) {
         pixel.swap(0, 2);
@@ -209,17 +230,19 @@ pub fn paint(
 
 /// The card's chrome: the two shadow layers outside the panel, then its translucent
 /// body and the hairline that joins the body to the shadow.
-fn panel(pixels: &mut [u8], width: u32, height: u32, config: &Config) {
+fn panel(pixels: &mut [u8], width: u32, height: u32, config: &Config, density: u32) {
     pixels.fill(0);
 
-    let margin = SHADOW;
+    let margin = SHADOW * density;
+    let radius = RADIUS * density as f32;
     let x = margin as f32;
     let (w, h) = (width as f32 - 2.0 * x, height as f32 - 2.0 * x);
     shadow(
         pixels,
         width,
         height,
-        &Panel { x: margin, y: margin, w: w as u32, h: h as u32, r: RADIUS as u32 },
+        &Panel { x: margin, y: margin, w: w as u32, h: h as u32, r: radius as u32 },
+        density,
     );
 
     let Some(mut pixmap) = PixmapMut::from_bytes(pixels, width, height) else {
@@ -230,13 +253,15 @@ fn panel(pixels: &mut [u8], width: u32, height: u32, config: &Config) {
     fill.set_color_rgba8(background.0, background.1, background.2, background.3);
     fill.anti_alias = true;
     pixmap.fill_path(
-        &rounded_rect(x, x, w, h, RADIUS),
+        &rounded_rect(x, x, w, h, radius),
         &fill,
         FillRule::Winding,
         Transform::identity(),
         None,
     );
 
+    // The hairline is measured in buffer pixels, not logical ones: it stays one device
+    // pixel thin on a dense output, which is what an edge highlight wants there.
     let stroke_width = config.border.width;
     // Zero means no hairline, and tiny-skia would draw a one-pixel stroke for it
     // anyway. A stroke at least as wide as the panel would invert the inset path.
@@ -251,7 +276,7 @@ fn panel(pixels: &mut [u8], width: u32, height: u32, config: &Config) {
         x + inset,
         w - stroke_width,
         h - stroke_width,
-        RADIUS - inset,
+        radius - inset,
     );
     let hairline = Stroke { width: stroke_width, ..Stroke::default() };
 
@@ -306,11 +331,11 @@ impl Panel {
 /// Both drop-shadow layers in one pass. They share the panel outline, so each pixel gets
 /// its alpha from both falloffs and is written once. The buffer arrives cleared, so only
 /// pixels the shadow touches are written.
-fn shadow(buf: &mut [u8], w: u32, h: u32, panel: &Panel) {
+fn shadow(buf: &mut [u8], w: u32, h: u32, panel: &Panel, density: u32) {
     // (blur, vertical offset, alpha by squared distance)
     let layers: [(u32, i64, Vec<u32>); 2] = [SHADOW_WIDE, SHADOW_TIGHT].map(|(blur, a0, offset)| {
-        let b = blur.max(1);
-        let offset = offset as i64;
+        let b = (blur * density).max(1);
+        let offset = (offset * density) as i64;
         let lut = (0..=b * b)
             .map(|d2| {
                 // A blurred edge starts at half the peak and eases out: a ramp from the
@@ -487,7 +512,7 @@ fn shift(pixels: &mut [u8], width: u32, height: u32, dx: i32, dy: i32) {
 
 /// Draws the icon in its slot: scaled to fit, never enlarged, and centred vertically in
 /// the panel. The scaling is a shader, so there is no resampler to keep correct here.
-fn draw_icon(pixels: &mut [u8], width: u32, height: u32, image: &Icon) {
+fn draw_icon(pixels: &mut [u8], width: u32, height: u32, image: &Icon, density: u32) {
     let Some(mut pixmap) = PixmapMut::from_bytes(pixels, width, height) else {
         return;
     };
@@ -495,10 +520,11 @@ fn draw_icon(pixels: &mut [u8], width: u32, height: u32, image: &Icon) {
         return;
     };
 
-    let scale = (ICON / image.width as f32).min(ICON / image.height as f32).min(1.0);
+    let slot = ICON * density as f32;
+    let scale = (slot / image.width as f32).min(slot / image.height as f32).min(1.0);
     let (w, h) = (image.width as f32 * scale, image.height as f32 * scale);
     // The panel is centred in its buffer, so the slot is centred the same way.
-    let (x, y) = (SHADOW as f32 + PAD, (height as f32 - h) / 2.0);
+    let (x, y) = (((SHADOW as f32) + PAD) * density as f32, (height as f32 - h) / 2.0);
 
     let paint = Paint {
         shader: Pattern::new(
@@ -542,6 +568,7 @@ fn countdown(
     height: u32,
     config: &Config,
     remaining: f32,
+    density: u32,
 ) {
     if remaining <= 0.0 {
         return;
@@ -550,9 +577,12 @@ fn countdown(
         return;
     };
 
-    let margin = SHADOW as f32;
-    let span = (width as f32 - 2.0 * margin - 2.0 * RADIUS) * remaining.min(1.0);
-    let y = height as f32 - margin - config.border.width - COUNTDOWN_H;
+    let density = density as f32;
+    let margin = SHADOW as f32 * density;
+    let radius = RADIUS * density;
+    let height_px = COUNTDOWN_H * density;
+    let span = (width as f32 - 2.0 * margin - 2.0 * radius) * remaining.min(1.0);
+    let y = height as f32 - margin - config.border.width - height_px;
     let mut ink = Paint::default();
     ink.set_color_rgba8(
         COUNTDOWN_INK.0,
@@ -562,7 +592,7 @@ fn countdown(
     );
     ink.anti_alias = true;
     pixmap.fill_path(
-        &rect(margin + RADIUS, y, span, COUNTDOWN_H),
+        &rect(margin + radius, y, span, height_px),
         &ink,
         FillRule::Winding,
         Transform::identity(),
@@ -579,8 +609,12 @@ fn text(
     swash: &mut SwashCache,
     buffer: &mut Buffer,
     has_icon: bool,
+    density: u32,
 ) {
-    let margin = SHADOW as f32;
+    // The metrics were shaped at this density, so the layout is already in buffer pixels
+    // and the glyphs are rasterised at it; only the fixed insets are still logical.
+    let margin = SHADOW as f32 * density as f32;
+    let inset = text_x(has_icon) * density as f32;
     buffer.shape_until_scroll(font_system, false);
     for run in buffer.layout_runs() {
         for glyph in run.glyphs {
@@ -588,7 +622,7 @@ fn text(
                 continue;
             };
             let origin = glyph.physical(
-                (margin + text_x(has_icon), margin + PAD + run.line_y),
+                (margin + inset, margin + PAD * density as f32 + run.line_y),
                 1.0,
             );
             let Some(image) = swash.get_image(font_system, origin.cache_key) else {
@@ -687,11 +721,22 @@ mod tests {
     use crate::dbus::Notification;
 
     fn render_with(config: Config, sample: Notification, progress: f32) -> (Vec<u8>, u32, u32) {
+        render_at(config, sample, progress, 1)
+    }
+
+    /// The same frame at an output density, for the HiDPI path.
+    fn render_at(
+        config: Config,
+        sample: Notification,
+        progress: f32,
+        scale: u32,
+    ) -> (Vec<u8>, u32, u32) {
         let mut font_system = FontSystem::new();
         let has_icon = sample.icon.is_some();
-        let mut buffer = build(&mut font_system, &config, &sample);
-        let height = card_height(&mut font_system, &mut buffer, has_icon);
-        let (width, height) = surface(PANEL_W, height);
+        let mut buffer = build(&mut font_system, &config, scale, &sample);
+        let height = card_height(&mut font_system, &mut buffer, has_icon, scale);
+        let (width, height) = surface(PANEL_W, height.div_ceil(scale));
+        let (width, height) = (width * scale, height * scale);
         let mut canvas = vec![0u8; width as usize * height as usize * 4];
         let mut swash = SwashCache::new();
         paint(
@@ -705,6 +750,7 @@ mod tests {
             &mut buffer,
             progress,
             None,
+            scale,
         );
         (canvas, width, height)
     }
@@ -727,6 +773,7 @@ mod tests {
             &mut buffer,
             1.0,
             remaining,
+            1,
         );
         (canvas, width, height)
     }
@@ -848,13 +895,87 @@ mod tests {
         assert!(bottom < body, "and dark underneath: {bottom} against {body}");
     }
 
+    /// A dense output gets a buffer at its own density: the same panel, twice the pixels,
+    /// and every logical constant (shadow margin, radius, padding) doubled with it.
+    #[test]
+    fn a_dense_output_gets_a_panel_at_its_own_resolution() {
+        let one = render_with(Config::default(), sample(), 1.0);
+        let two = render_at(Config::default(), sample(), 1.0, 2);
+
+        assert_eq!((two.1, two.2), (2 * one.1, 2 * one.2), "the buffer follows the density");
+
+        let (canvas, width, height) = (two.0, two.1, two.2);
+        let (w, h) = (width as usize, height as usize);
+        let mid = h / 2;
+        let alpha = |x: usize, y: usize| canvas[(y * w + x) * 4 + 3];
+
+        let margin = (SHADOW * 2) as usize;
+        assert!(alpha(margin + 2, mid) > 200, "the body is on the panel");
+        assert!((1..255).contains(&alpha(margin - 1, mid)), "and the shadow outside it");
+        for (x, y) in [(0usize, 0usize), (w - 1, 0), (0, h - 1), (w - 1, h - 1)] {
+            assert_eq!(alpha(x, y), 0, "corner ({x},{y}) stays empty");
+        }
+        assert!(
+            canvas
+                .chunks_exact(4)
+                .any(|pixel| pixel[0] > 200 && pixel[1] > 200 && pixel[2] > 200),
+            "the text is rasterised at the buffer density"
+        );
+    }
+
+    /// The hairline is measured in buffer pixels, so a dense output gets the same one
+    /// device pixel rather than a thicker line.
+    #[test]
+    fn the_hairline_stays_one_pixel_thin_at_any_density() {
+        let one = render_with(Config::default(), sample(), 1.0);
+        let two = render_at(Config::default(), sample(), 1.0, 2);
+
+        for (canvas, width, _, scale) in [(one.0, one.1, one.2, 1u32), (two.0, two.1, two.2, 2)] {
+            let margin = (SHADOW * scale) as usize;
+            let w = width as usize;
+            let row = |y: usize| canvas[(y * w + w / 2) * 4];
+            let body = row(margin + 3 * scale as usize);
+            assert_ne!(row(margin), body, "scale {scale}: the top edge is a hairline");
+            assert_eq!(
+                row(margin + 1),
+                body,
+                "scale {scale}: and it is one physical pixel thin"
+            );
+        }
+    }
+
+    /// The panel's logical height is unchanged by density, so its pixels double and the
+    /// height clamp doubles with them.
+    #[test]
+    fn a_dense_panel_is_twice_as_tall_in_its_own_pixels() {
+        let mut font_system = FontSystem::new();
+        let mut one = build(&mut font_system, &Config::default(), 1, &sample());
+        let mut two = build(&mut font_system, &Config::default(), 2, &sample());
+        let single = card_height(&mut font_system, &mut one, false, 1);
+        let dense = card_height(&mut font_system, &mut two, false, 2);
+        assert!(dense.abs_diff(2 * single) <= 2, "{single} at 1x, {dense} at 2x");
+
+        let long = Notification {
+            id: 2,
+            app_name: String::new(),
+            summary: "s".into(),
+            body: "wrapping words ".repeat(400),
+            timeout: None,
+            icon: None,
+        };
+        let mut one = build(&mut font_system, &Config::default(), 1, &long);
+        let mut two = build(&mut font_system, &Config::default(), 2, &long);
+        assert_eq!(card_height(&mut font_system, &mut one, false, 1), MAX_H);
+        assert_eq!(card_height(&mut font_system, &mut two, false, 2), MAX_H * 2);
+    }
+
     /// Guards the fontconfig trap where weight 600 for the generic sans family
     /// resolves to a serif CJK face whose missing space falls back to a colour
     /// emoji, leaving a seventeen-pixel hole in the title.
     #[test]
     fn title_is_shaped_from_one_font() {
         let mut font_system = FontSystem::new();
-        let mut buffer = build(&mut font_system, &Config::default(), &sample());
+        let mut buffer = build(&mut font_system, &Config::default(), 1, &sample());
         buffer.shape_until_scroll(&mut font_system, false);
 
         let title = buffer
@@ -992,8 +1113,8 @@ mod tests {
             timeout: None,
             icon: None,
         };
-        let mut buffer = build(&mut font_system, &Config::default(), &long);
-        assert_eq!(card_height(&mut font_system, &mut buffer, false), MAX_H);
+        let mut buffer = build(&mut font_system, &Config::default(), 1, &long);
+        assert_eq!(card_height(&mut font_system, &mut buffer, false, 1), MAX_H);
     }
 
     #[test]

@@ -92,7 +92,8 @@ impl<'de> Deserialize<'de> for FontWeight {
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Border {
-    /// Stroke width in logical pixels. `0` draws no hairline at all.
+    /// Stroke width in buffer pixels, so a 1px hairline stays one device pixel thin on a
+    /// dense output. `0` draws no hairline at all.
     pub width: f32,
     /// The hairline's lit ink: it is drawn solid at the top edge and fades out over the
     /// panel height, over a fixed dark underside.

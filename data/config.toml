@@ -9,7 +9,9 @@
 # changes nothing. A file that is present but wrong is an error, not a silent fallback.
 #
 # Colours are #rgb, #rgba, #rrggbb or #rrggbbaa. The alpha channel matters: below ff
-# the panel is translucent over whatever is behind it.
+# the panel is translucent over whatever is behind it. Sizes are logical pixels, so a
+# dense output renders the same panel at its own resolution; the hairline is the one
+# exception and is measured in buffer pixels.
 
 [panel]
 # Where the stack sits: top-left, bottom-left, top-center, bottom-center, top-right or
@@ -18,7 +20,8 @@
 position = "top-right"
 
 [border]
-# Stroke width in logical pixels. 0 draws no hairline.
+# Stroke width in buffer pixels: 1 stays one device pixel thin on a dense output.
+# 0 draws no hairline.
 width = 1.0
 # The hairline's lit ink: solid along the top edge, fading out over the panel height,
 # over a fixed dark underside that joins it to the shadow.
