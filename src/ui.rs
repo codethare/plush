@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use calloop::{timer::TimeoutAction, LoopHandle, RegistrationToken};
 use cosmic_text::{Buffer, FontSystem, SwashCache};
 use smithay_client_toolkit::{
-    compositor::{CompositorHandler, CompositorState},
+    compositor::{CompositorHandler, CompositorState, Region},
     delegate_registry,
     output::{OutputHandler, OutputState},
     registry::{ProvidesRegistryState, RegistryState},
@@ -345,6 +345,18 @@ impl Ui {
         // The surface carries the panel plus its shadow margin on every side.
         let (surface_w, surface_h) = render::surface(render::PANEL_W, height);
         card.set_size(surface_w, surface_h);
+        // Only the panel takes clicks. The shadow margin belongs to the surface, but a
+        // press beside a notification must not dismiss it — with cards stacked, the
+        // margin of one would otherwise swallow presses meant for the one next to it.
+        let region =
+            Region::new(&self.compositor).expect("plush: wl_compositor is bound");
+        region.add(
+            render::SHADOW as i32,
+            render::SHADOW as i32,
+            render::PANEL_W as i32,
+            height as i32,
+        );
+        card.set_input_region(Some(region.wl_region()));
         // An initial commit with no buffer; the configure it triggers is what draws.
         card.commit();
 
