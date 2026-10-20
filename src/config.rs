@@ -211,8 +211,10 @@ pub enum Row {
     Bottom,
 }
 
-/// The screen edge a panel arrives from.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The side of something: the screen edge a panel arrives from, or the panel edge the
+/// countdown line runs along.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
 pub enum Edge {
     Left,
     Right,
@@ -279,6 +281,21 @@ impl Default for Animation {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct Countdown {
+    /// The panel edge the countdown line runs along: `top` and `bottom` give a horizontal
+    /// bar, `left` and `right` a vertical one. It drains from the far end of that edge, so
+    /// a horizontal bar starts at the left and a vertical one at the top.
+    pub position: Edge,
+}
+
+impl Default for Countdown {
+    fn default() -> Self {
+        Self { position: Edge::Bottom }
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -287,6 +304,7 @@ pub struct Config {
     pub background: Background,
     pub font: Font,
     pub animation: Animation,
+    pub countdown: Countdown,
 }
 
 /// Where the configuration is looked for.
@@ -405,6 +423,27 @@ mod tests {
         let bad: Result<Config, _> = toml::from_str("[panel]\nposition = \"middle\"\n");
         let message = bad.expect_err("middle is not a position").to_string();
         assert!(message.contains("top-left"), "the error should list the choices: {message}");
+    }
+
+    /// The countdown line can run along any edge, and the default is the bottom one.
+    #[test]
+    fn the_countdown_edge_parses_and_defaults_to_the_bottom() {
+        assert_eq!(Config::default().countdown.position, Edge::Bottom);
+
+        for (name, edge) in [
+            ("top", Edge::Top),
+            ("bottom", Edge::Bottom),
+            ("left", Edge::Left),
+            ("right", Edge::Right),
+        ] {
+            let config: Config =
+                toml::from_str(&format!("[countdown]\nposition = {name:?}\n")).expect(name);
+            assert_eq!(config.countdown.position, edge, "{name}");
+        }
+
+        let bad: Result<Config, _> = toml::from_str("[countdown]\nposition = \"middle\"\n");
+        let message = bad.expect_err("middle is not an edge").to_string();
+        assert!(message.contains("left"), "the error should list the choices: {message}");
     }
 
     #[test]

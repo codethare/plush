@@ -31,6 +31,12 @@ color = "#ffffff22"
 # Dark "system" grey, translucent.
 color = "#1e1e1ed4"
 
+[countdown]
+# The panel edge the countdown line runs along: "top" and "bottom" are horizontal bars,
+# "left" and "right" vertical ones. It drains from the far end of that edge, so a
+# horizontal bar starts at the left and a vertical one at the top.
+position = "bottom"
+
 [animation]
 # Slide and fade each panel in from the right, and back out when it goes away.
 # Off makes panels appear and vanish instantly.

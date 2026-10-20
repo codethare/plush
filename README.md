@@ -90,7 +90,7 @@ place, in which case the bus starts the daemon first and there is then nothing t
 | Max height | 320 px; longer bodies are clipped |
 | Expiry | per-notification; `-1` becomes 5000 ms, `0` never expires |
 | Hold | a pointer inside a panel pauses its timeout; leaving resumes with the time that was left |
-| Countdown | a 2 px line inside the bottom edge showing how much of the timeout is left; a notification that never expires has none |
+| Countdown | a 2 px line along one edge showing how much of the timeout is left — inside the bottom edge unless `[countdown] position` moves it; a notification that never expires has none |
 | Animation | slides in from the nearest edge and fades up over 220 ms; the same motion reversed on the way out |
 | `replaces_id` | replaces the content in place and restarts the timeout |
 | Dismiss | pointer press, `CloseNotification`, or `plush dismiss` |
@@ -160,6 +160,12 @@ A panel arrives from the edge its position is nearest, so the direction follows 
 |---|---|---|
 | `color` | `"#1e1e1ed4"` | A translucent dark grey. |
 
+### `[countdown]`
+
+| Key | Default | |
+|---|---|---|
+| `position` | `"bottom"` | The panel edge the countdown line runs along. `top` and `bottom` are horizontal bars, `left` and `right` vertical ones; it drains from the far end of that edge, so a horizontal bar starts at the left and a vertical one at the top. |
+
 ### `[font]`
 
 | Key | Default | |
@@ -208,9 +214,9 @@ about twenty times a second while its countdown line drains, with or without ani
   asks for an exclusive zone can still be covered. A bar anchored to a corner only is in the same
   group: the protocol treats a positive zone on a corner anchor as zero, so it reserves nothing
   either.
-- No configuration beyond the position, the border, the background, the font and the
-  animation toggle. Panel width, padding, corner radius, the stack limit, the text colours,
-  the icon size and the countdown line are compile-time constants.
+- No configuration beyond the position, the border, the background, the font, the countdown
+  edge and the animation toggle. Panel width, padding, corner radius, the stack limit, the
+  text colours and the icon size are compile-time constants.
 - No icon from `image-path`, from `app_icon` or from an icon theme: only the pixels a client
   puts in `image-data` are drawn, so an app that sends a path or a theme name still gets a
   text-only panel. An `image-data` hint is taken as 8 bits per sample, 3 or 4 channels, and
@@ -303,7 +309,8 @@ end, because `wl_shm`'s `Argb8888` is BGRA in memory while `tiny-skia` paints RG
   not yet measured against a real HiDPI output.
 - Icons and the countdown line are covered by unit tests for the slot geometry, the aspect
   ratio, the vertical centring, the wrap width beside a slot, the length of the line against
-  the timeout, and that neither is drawn without a hint or without a timeout — plus the
+  the timeout, the line on each of its four edges draining from the far end, and that
+  neither is drawn without a hint or without a timeout — plus the
   `image-data` parse, including every shape of hint that has to be refused rather than
   guessed at.
 - The hold is covered by unit tests for the remaining time, the resumption with what was

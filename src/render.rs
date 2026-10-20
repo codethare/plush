@@ -580,9 +580,28 @@ fn countdown(
     let density = density as f32;
     let margin = SHADOW as f32 * density;
     let radius = RADIUS * density;
-    let height_px = COUNTDOWN_H * density;
-    let span = (width as f32 - 2.0 * margin - 2.0 * radius) * remaining.min(1.0);
-    let y = height as f32 - margin - config.border.width - height_px;
+    let thickness = COUNTDOWN_H * density;
+    let border = config.border.width;
+    // The line hugs its edge, inset by the hairline so it never paints over it, and by the
+    // corner radius along it so it never crosses the rounded corners.
+    let position = config.countdown.position;
+    let (x, y, w, h) = if matches!(position, Edge::Top | Edge::Bottom) {
+        let span = (width as f32 - 2.0 * margin - 2.0 * radius) * remaining.min(1.0);
+        let y = if position == Edge::Top {
+            margin + border
+        } else {
+            height as f32 - margin - border - thickness
+        };
+        (margin + radius, y, span, thickness)
+    } else {
+        let span = (height as f32 - 2.0 * margin - 2.0 * radius) * remaining.min(1.0);
+        let x = if position == Edge::Left {
+            margin + border
+        } else {
+            width as f32 - margin - border - thickness
+        };
+        (x, margin + radius, thickness, span)
+    };
     let mut ink = Paint::default();
     ink.set_color_rgba8(
         COUNTDOWN_INK.0,
@@ -592,7 +611,7 @@ fn countdown(
     );
     ink.anti_alias = true;
     pixmap.fill_path(
-        &rect(margin + radius, y, span, height_px),
+        &rect(x, y, w, h),
         &ink,
         FillRule::Winding,
         Transform::identity(),
@@ -781,8 +800,16 @@ mod tests {
     /// A panel with nothing in it but what is drawn on top of it, so an ink box is the
     /// icon and the glyphs and nothing else.
     fn transparent() -> Config {
-        toml::from_str("[background]\ncolor = \"#00000000\"\n\n[border]\nwidth = 0.0\n")
-            .expect("a transparent panel")
+        transparent_on("bottom")
+    }
+
+    /// The same, with the countdown line running along `edge`.
+    fn transparent_on(edge: &str) -> Config {
+        toml::from_str(&format!(
+            "[background]\ncolor = \"#00000000\"\n\n[border]\nwidth = 0.0\n\n\
+             [countdown]\nposition = \"{edge}\"\n"
+        ))
+        .expect("a transparent panel")
     }
 
     /// An icon of one flat colour, so a pixel can say where it came from.
@@ -1295,6 +1322,64 @@ mod tests {
         assert_eq!(half_left, left, "the left end never moves");
         assert!(half_right < right, "half the timeout is a shorter line");
         assert_eq!(inked_box(&gone.0, gone.1, gone.2), None, "and no line once it is up");
+    }
+
+    /// The line hugs whichever edge it is configured for: top and bottom run horizontally,
+    /// left and right vertically, each between the corners and draining from its far end.
+    #[test]
+    fn the_countdown_line_follows_its_configured_edge() {
+        let line = COUNTDOWN_H as usize;
+        let corner = RADIUS as usize;
+
+        for edge in ["top", "bottom", "left", "right"] {
+            let full = render_countdown(transparent_on(edge), Some(1.0));
+            let (left, right, top, bottom) =
+                inked_box(&full.0, full.1, full.2).unwrap_or_else(|| panic!("{edge}: no line"));
+            let panel = (PANEL_W as usize, full.2 as usize - 2 * SHADOW as usize);
+            let (across, along) = ((corner, panel.0 - corner - 1), (corner, panel.1 - corner - 1));
+
+            match edge {
+                "top" => {
+                    assert_eq!((left, right), across, "{edge}: between the corners");
+                    assert_eq!((top, bottom), (0, line - 1), "{edge}: a bar at the top");
+                }
+                "bottom" => {
+                    assert_eq!((left, right), across, "{edge}: between the corners");
+                    assert_eq!(
+                        (top, bottom),
+                        (panel.1 - line, panel.1 - 1),
+                        "{edge}: a bar at the bottom"
+                    );
+                }
+                "left" => {
+                    assert_eq!((left, right), (0, line - 1), "{edge}: a bar at the left");
+                    assert_eq!((top, bottom), along, "{edge}: between the corners");
+                }
+                _ => {
+                    assert_eq!(
+                        (left, right),
+                        (panel.0 - line, panel.0 - 1),
+                        "{edge}: a bar at the right"
+                    );
+                    assert_eq!((top, bottom), along, "{edge}: between the corners");
+                }
+            }
+
+            // Half the timeout shortens it from the far end, never from the near one.
+            let half = render_countdown(transparent_on(edge), Some(0.5));
+            let (half_left, half_right, half_top, half_bottom) =
+                inked_box(&half.0, half.1, half.2).unwrap_or_else(|| panic!("{edge}: no line"));
+            match edge {
+                "top" | "bottom" => {
+                    assert_eq!(half_left, left, "{edge}: the left end never moves");
+                    assert!(half_right < right, "{edge}: half the timeout is a shorter line");
+                }
+                _ => {
+                    assert_eq!(half_top, top, "{edge}: the top end never moves");
+                    assert!(half_bottom < bottom, "{edge}: half the timeout is a shorter line");
+                }
+            }
+        }
     }
 
     /// A panel that never expires has no line to draw.
