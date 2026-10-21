@@ -301,7 +301,9 @@ end, because `wl_shm`'s `Argb8888` is BGRA in memory while `tiny-skia` paints RG
   `CloseNotification`, and timeout expiry all behave, with zero `wl_display` errors in the
   Wayland protocol trace.
 - Panel pixels are covered by unit tests asserting the rounded corners, the opaque
-  interior, and that a title never falls back to a second font mid-run.
+  interior, that a title never falls back to a second font mid-run, that the shadow wraps
+  the corners as well as the sides, and that none of it is painted under the translucent
+  body.
 - The dense path is covered headless at 1× and 2×: the buffer doubles, the shadow margin
   and corner radius double with it, the text is rasterised at the buffer density, the
   hairline stays one physical pixel, and the height clamp doubles. The compositor side of

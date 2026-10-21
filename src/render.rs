@@ -320,17 +320,9 @@ struct Panel {
     r: u32,
 }
 
-impl Panel {
-    /// Whole-pixel span `[x0, x1)` of panel-relative row `rel` in buffer coords.
-    fn span(&self, rel: u32) -> (u32, u32) {
-        let (x0, x1) = rounded_span(self.w, self.h, self.r, rel);
-        (self.x + x0, self.x + x1)
-    }
-}
-
 /// Both drop-shadow layers in one pass. They share the panel outline, so each pixel gets
 /// its alpha from both falloffs and is written once. The buffer arrives cleared, so only
-/// pixels the shadow touches are written.
+/// the band the layers can reach is touched.
 fn shadow(buf: &mut [u8], w: u32, h: u32, panel: &Panel, density: u32) {
     // (blur, vertical offset, alpha by squared distance)
     let layers: [(u32, i64, Vec<u32>); 2] = [SHADOW_WIDE, SHADOW_TIGHT].map(|(blur, a0, offset)| {
@@ -347,121 +339,85 @@ fn shadow(buf: &mut [u8], w: u32, h: u32, panel: &Panel, density: u32) {
         (b, offset, lut)
     });
     let reach = layers.iter().map(|l| l.0).max().unwrap_or(1);
-    // Alpha by horizontal distance, rebuilt per row: the two falloffs are combined once
-    // per column distance instead of once per shadow pixel.
-    let mut band = vec![0u8; reach as usize + 1];
-    // Rows inside the panel all share dv = 0, so the band is usually built once.
+    let drop = layers.iter().map(|l| l.1.max(0) as u32).max().unwrap_or(0);
+
+    let half_w = panel.w as f32 / 2.0;
+    let half_h = panel.h as f32 / 2.0;
+    let radius = (panel.r as f32).min(half_w).min(half_h);
+    let (cx, cy) = (panel.x as f32 + half_w, panel.y as f32 + half_h);
+
+    let x0 = panel.x.saturating_sub(reach);
+    let x1 = (panel.x + panel.w + reach).min(w);
+    let y0 = panel.y.saturating_sub(reach);
+    let y1 = (panel.y + panel.h + reach + drop).min(h);
+
+    // Alpha by horizontal position, rebuilt only when the row's geometry changes: every
+    // row level with the straight part of both layers shares one profile. `inked` is the
+    // span of it that holds anything, so the rows themselves copy only the two bands.
+    let mut band = vec![0u8; (x1 - x0) as usize];
+    let mut inked = 0..0;
     let mut cached = [u32::MAX; 2];
 
-    for by in 0..h {
-        let y = by as i64;
-        // Per layer: squared row distance from the shifted body, clamped to the layer's
-        // blur (the offset is what hangs the shadow below the panel).
-        let dv: [u32; 2] = [0, 1].map(|k| {
-            let (b, offset, _) = &layers[k];
-            let top = panel.y as i64 + *offset;
-            let bottom = top + panel.h as i64;
-            let d = if y < top {
-                top - y
-            } else if y >= bottom {
-                y - bottom + 1
-            } else {
-                0
-            };
-            let d = d.min(*b as i64) as u32;
-            d * d
+    for y in y0..y1 {
+        let py = y as f32 + 0.5;
+        // Per layer: this row's distance from the shifted outline's centre line. When it
+        // is at most the straight half, the distance to the outline is horizontal alone.
+        let row: [(f32, u32, &Vec<u32>); 2] = [0, 1].map(|k| {
+            let (blur, offset, lut) = &layers[k];
+            let qy = (py - cy - *offset as f32).abs() - (half_h - radius);
+            (qy, *blur, lut)
         });
-        if !(0..2).any(|k| dv[k] < layers[k].0 * layers[k].0) {
-            continue;
-        }
-        // The outline row comes from the body itself, not from the offset shape: both
-        // layers must see the same span, or their falloffs leave a stripe where one
-        // starts further out than the other.
-        let rel = (y - panel.y as i64).clamp(0, panel.h as i64 - 1) as u32;
-        let (x0, x1) = panel.span(rel);
-        let start = x0.saturating_sub(reach);
-        let end = (x1 + reach).min(w);
-        if dv != cached {
-            cached = dv;
-            for (dx, out) in band.iter_mut().enumerate() {
-                let dx2 = (dx * dx) as u32;
-                let mut a = 0u32;
-                for (k, (b, _, lut)) in layers.iter().enumerate() {
-                    let la = lut[(dx2 + dv[k]).min(b * b) as usize];
-                    a = la + div255(a * (255 - la));
+
+        let key = [row[0].0.to_bits(), row[1].0.to_bits()];
+        if key != cached {
+            cached = key;
+            // The panel's own outline: the body is translucent, so nothing may be painted
+            // underneath it. Only the layers' shifted outlines reach past it.
+            let panel_qy = (py - cy).abs() - (half_h - radius);
+            let mut first = band.len();
+            let mut last = 0;
+            for (i, out) in band.iter_mut().enumerate() {
+                let qx = (x0 as f32 + i as f32 + 0.5 - cx).abs() - (half_w - radius);
+                let a = if outline_gap(qx, panel_qy, radius) <= 0.0 {
+                    0
+                } else {
+                    let mut a = 0u32;
+                    for (qy, blur, lut) in row {
+                        // Each layer is that same outline shifted down, so the light reads
+                        // as coming from above; inside a shifted outline it is at peak.
+                        let d = outline_gap(qx, qy, radius).max(0.0);
+                        let la = lut[((d * d) as u32).min(blur * blur) as usize];
+                        a = la + div255(a * (255 - la));
+                    }
+                    a as u8
+                };
+                if a > 0 {
+                    first = first.min(i);
+                    last = i;
                 }
-                *out = a as u8;
+                *out = a;
             }
+            inked = if last >= first { first..last + 1 } else { 0..0 };
         }
-        // Two bands outside the outline; the body itself is painted later, so it is
-        // stepped over rather than tested per pixel.
-        if by >= panel.y && by < panel.y + panel.h {
-            put_band(buf, w, by, start..x0.min(end), (x0, x1), Side::Left, &band);
-            put_band(buf, w, by, x1.max(start)..end, (x0, x1), Side::Right, &band);
-        } else {
-            put_band(buf, w, by, start..end, (x0, x1), Side::Row, &band);
+
+        let row_start = y as usize * w as usize + x0 as usize + inked.start;
+        let dst = &mut buf[row_start * 4..(row_start + inked.len()) * 4];
+        for (pixel, a) in dst.chunks_exact_mut(4).zip(&band[inked.clone()]) {
+            pixel.copy_from_slice(&[0, 0, 0, *a]);
         }
     }
 }
 
-/// Which part of an outline row a shadow band covers.
-#[derive(Clone, Copy)]
-enum Side {
-    Left,
-    Right,
-    /// The whole row: the body is not there, so the middle is shadow too.
-    Row,
-}
-
-/// Writes one row's shadow band: premultiplied black, so only the alpha byte.
-fn put_band(
-    buf: &mut [u8],
-    w: u32,
-    by: u32,
-    xs: std::ops::Range<u32>,
-    (x0, x1): (u32, u32),
-    side: Side,
-    band: &[u8],
-) {
-    for x in xs {
-        let dx = match side {
-            Side::Left => x0 - 1 - x,
-            Side::Right => x - x1,
-            Side::Row if x < x0 => x0 - 1 - x,
-            Side::Row if x >= x1 => x - x1,
-            Side::Row => 0,
-        };
-        let a = band[(dx as usize).min(band.len() - 1)];
-        let dst = &mut buf[((by * w + x) * 4) as usize..][..4];
-        dst.copy_from_slice(&[0, 0, 0, a]);
+/// Signed distance from a rounded rectangle's outline, given the horizontal and vertical
+/// gaps to where its corner arcs begin: negative inside.
+fn outline_gap(qx: f32, qy: f32, radius: f32) -> f32 {
+    if qy <= 0.0 {
+        qx - radius
+    } else if qx <= 0.0 {
+        qy - radius
+    } else {
+        (qx * qx + qy * qy).sqrt() - radius
     }
-}
-
-/// Horizontal pixel span `[x0, x1)` of the rounded panel at row `y` (x0 inclusive, x1
-/// exclusive). Corner pixels fall outside the span; middle rows span the full width.
-fn rounded_span(w: u32, h: u32, r: u32, y: u32) -> (u32, u32) {
-    if y >= h {
-        return (0, 0);
-    }
-    let inset = rounded_inset(w, h, r, y).ceil() as u32;
-    (inset.min(w), w.saturating_sub(inset))
-}
-
-/// Fractional horizontal inset of the rounded outline at row `y`.
-fn rounded_inset(w: u32, h: u32, r: u32, y: u32) -> f64 {
-    let r = r.min(w / 2).min(h / 2);
-    if r == 0 || y >= h {
-        return 0.0;
-    }
-    let rr = (r * r) as f64;
-    let py = y as f64 + 0.5;
-    let top = r as f64;
-    let bottom = h as f64 - r as f64;
-    if py >= top && py <= bottom {
-        return 0.0;
-    }
-    let dy = if py < top { top - py } else { py - bottom };
-    r as f64 - (rr - dy * dy).max(0.0).sqrt()
 }
 
 fn div255(x: u32) -> u32 {
@@ -718,18 +674,25 @@ fn blit(
     }
 }
 
+/// Control-point offset that turns a cubic into a quarter circle: `4/3·tan(π/8)`.
+const KAPPA: f32 = 0.552_284_8;
+
+/// A rounded rectangle whose corners are circular arcs, matching the outline the shadow is
+/// measured from. A quadratic through the corner point would pull the corner in by half a
+/// pixel at this radius, leaving a seam between the body and its shadow.
 fn rounded_rect(x: f32, y: f32, w: f32, h: f32, radius: f32) -> Path {
     let r = radius.max(0.0).min(w / 2.0).min(h / 2.0);
+    let c = r * KAPPA;
     let mut path = PathBuilder::new();
     path.move_to(x + r, y);
     path.line_to(x + w - r, y);
-    path.quad_to(x + w, y, x + w, y + r);
+    path.cubic_to(x + w - r + c, y, x + w, y + r - c, x + w, y + r);
     path.line_to(x + w, y + h - r);
-    path.quad_to(x + w, y + h, x + w - r, y + h);
+    path.cubic_to(x + w, y + h - r + c, x + w - r + c, y + h, x + w - r, y + h);
     path.line_to(x + r, y + h);
-    path.quad_to(x, y + h, x, y + h - r);
+    path.cubic_to(x + r - c, y + h, x, y + h - r + c, x, y + h - r);
     path.line_to(x, y + r);
-    path.quad_to(x, y, x + r, y);
+    path.cubic_to(x, y + r - c, x + r - c, y, x + r, y);
     path.close();
     path.finish().expect("rounded rect is a valid path")
 }
@@ -902,6 +865,45 @@ mod tests {
         let far = alpha(SHADOW as usize - SHADOW_WIDE.0 as usize + 1, mid);
         assert!((1..255).contains(&near), "just outside is shadow, alpha={near}");
         assert!(near > far, "and it fades away from the panel: {near} then {far}");
+    }
+
+    /// The shadow wraps a corner instead of being cut off at it: measured straight out of
+    /// the arc, the corner carries a good share of what the edge beside it carries.
+    #[test]
+    fn the_shadow_wraps_the_corners() {
+        let (canvas, width, height) = render_with(Config::default(), sample(), 1.0);
+        let (w, h) = (width as usize, height as usize);
+        let margin = SHADOW as usize;
+        let alpha = |x: usize, y: usize| canvas[(y * w + x) * 4 + 3];
+
+        let edge = alpha(margin - 4, h / 2);
+        // Four pixels out from the arc, on the diagonal through the corner's centre.
+        let step = (RADIUS as f64 + 4.0) / 2f64.sqrt();
+        let at = (margin as f64 + RADIUS as f64 - step) as usize;
+        let corner = alpha(at, at);
+
+        assert!(corner > 0, "the corner has no shadow at all");
+        assert!(
+            corner * 3 >= edge,
+            "the corner carries {corner} against the edge's {edge}"
+        );
+    }
+
+    /// The body is translucent, so nothing may be painted underneath it: the layer that
+    /// hangs below the panel would otherwise darken the strip inside its top edge.
+    #[test]
+    fn no_shadow_is_painted_under_the_body() {
+        let (canvas, width, height) = render_with(Config::default(), sample(), 1.0);
+        let (w, _) = (width as usize, height as usize);
+        let margin = SHADOW as usize;
+        let alpha = |x: usize, y: usize| canvas[(y * w + x) * 4 + 3];
+        let column = margin + PANEL_W as usize / 2;
+
+        assert_eq!(
+            alpha(column, margin + 1),
+            alpha(column, margin + 8),
+            "the strip inside the top edge is body, not shadow"
+        );
     }
 
     /// The hairline is lit from above and dark underneath, so the translucent body and the
