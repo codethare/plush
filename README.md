@@ -7,14 +7,7 @@ translucent, rounded panel pinned to the top-right of the screen. It is small on
 about a thousand lines, five dependencies that matter, no configuration file, and no
 runtime state beyond the notifications currently on screen.
 
-```
-┌────────────────────────────────┐
-│ Test App                       │
-│ Build finished                 │
-│ cargo build --release succeeded│
-│ in 12.4s.                      │
-└────────────────────────────────┘
-```
+![Two plush panels in the top-right corner, over a terminal window](docs/screenshot.png)
 
 ## Requirements
 
