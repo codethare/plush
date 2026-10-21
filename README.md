@@ -7,7 +7,7 @@ translucent, rounded panel pinned to the top-right of the screen. It is small on
 about a thousand lines, five dependencies that matter, no configuration file, and no
 runtime state beyond the notifications currently on screen.
 
-![Two plush panels in the top-right corner, over a terminal window](docs/screenshot.png)
+![Two plush panels stacked in the top-right corner](docs/screenshot.png)
 
 ## Requirements
 
@@ -79,7 +79,7 @@ place, in which case the bus starts the daemon first and there is then nothing t
 | Panel | 380 px wide, 12 px corner radius, 16 px padding, a hairline edge and a drop shadow |
 | Dense output | drawn at the output's integer scale, so the panel keeps its logical size and its pixels are the output's own; fractional scaling uses the integer scale the compositor reports |
 | Icon | the `image-data` hint, fitted into a 32 px slot to the left of the text and never enlarged; `image-path` and `app_icon` are ignored |
-| Stack | up to 4 panels, 10 px apart, newest on top |
+| Stack | up to 4 panels, 24 px apart, newest on top |
 | Max height | 320 px; longer bodies are clipped |
 | Expiry | per-notification; `-1` becomes 5000 ms, `0` never expires |
 | Hold | a pointer inside a panel pauses its timeout; leaving resumes with the time that was left |
@@ -288,8 +288,8 @@ end, because `wl_shm`'s `Argb8888` is BGRA in memory while `tiny-skia` paints RG
   device), so its half rests on that reading.
 - The same session checks what a panel does not do: with four panels on screen a maximized window
   still covers the full output underneath them, and `bottom-right` and `top-center` are unmoved —
-  the first 16 px off the bottom of the free area with its stack 10 px apart, the second centred
-  horizontally on the output.
+  the first sits one panel margin off the bottom of the free area with its stack spaced by `GAP`,
+  the second centred horizontally on the output.
 - End-to-end against a headless sway: `notify-send`, `replaces_id` replacement,
   `CloseNotification`, and timeout expiry all behave, with zero `wl_display` errors in the
   Wayland protocol trace.

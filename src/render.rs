@@ -41,6 +41,11 @@ const SHADOW_WIDE: (u32, u32, u32) = (17, 130, 6);
 // The margin must fit the widest layer, or its falloff is cut off at the buffer edge.
 const _: () = assert!(SHADOW >= SHADOW_WIDE.0 + SHADOW_WIDE.2);
 
+/// How far the shadow reaches above a panel, in logical pixels: the widest layer's blur
+/// less the downward offset that keeps it out of the panel itself. Nothing else needs to
+/// know, but the gap between stacked cards has to clear it.
+pub const SHADOW_REACH_UP: u32 = SHADOW_WIDE.0 - SHADOW_WIDE.2;
+
 /// The hairline's dark underside. Its lit half is the configured border colour, faded
 /// over the height.
 const BORDER_DARK_ALPHA: u32 = 60;
