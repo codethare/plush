@@ -404,7 +404,14 @@ fn shadow(buf: &mut [u8], w: u32, h: u32, panel: &Panel, density: u32) {
             let mut last = 0;
             for (i, out) in band.iter_mut().enumerate() {
                 let qx = (x0 as f32 + i as f32 + 0.5 - cx).abs() - (half_w - radius);
-                let a = if outline_gap(qx, panel_qy, radius) <= 0.0 {
+                // The body's edge is antialiased, so its coverage fades in over the last
+                // pixel and the shadow has to fade out over the same one: gating the two on
+                // "is this pixel inside the outline" leaves the partly covered pixels along
+                // a corner arc with nothing behind them, and a light background shows through
+                // as a fleck. A whole pixel inside is still left to the body alone, because
+                // the body is translucent.
+                let cover = (outline_gap(qx, panel_qy, radius) + 1.0).clamp(0.0, 1.0);
+                let a = if cover <= 0.0 {
                     0
                 } else {
                     let mut a = 0u32;
@@ -415,7 +422,7 @@ fn shadow(buf: &mut [u8], w: u32, h: u32, panel: &Panel, density: u32) {
                         let la = lut[((d * d) as u32).min(blur * blur) as usize];
                         a = la + div255(a * (255 - la));
                     }
-                    a as u8
+                    (a as f32 * cover).round() as u8
                 };
                 if a > 0 {
                     first = first.min(i);
@@ -963,6 +970,46 @@ mod tests {
              {} against {body}",
             along[3]
         );
+    }
+
+    /// The shadow must not drop away where the body starts: the body's edge is antialiased
+    /// over one pixel, so if the shadow stops a pixel earlier, that pixel is only partly
+    /// covered and a light background shows through it as a fleck along a corner arc.
+    /// Crossing the edge, the coverage may rise but may not fall.
+    #[test]
+    fn the_shadow_does_not_drop_away_at_the_panel_edge() {
+        use std::f64::consts::PI;
+
+        let (canvas, width, height) = render_with(Config::default(), sample(), 1.0);
+        let (w, h) = (width as usize, height as usize);
+        let margin = SHADOW as f64;
+        let r = RADIUS as f64;
+        let alpha = |x: usize, y: usize| canvas[(y * w + x) * 4 + 3] as i32;
+
+        // (corner centre, the arc's angular range) — screen coordinates, y down.
+        let corners = [
+            (margin + r, margin + r, PI, 1.5 * PI),
+            (w as f64 - margin - r, margin + r, 1.5 * PI, 2.0 * PI),
+            (margin + r, h as f64 - margin - r, 0.5 * PI, PI),
+            (w as f64 - margin - r, h as f64 - margin - r, 0.0, 0.5 * PI),
+        ];
+        for (cx, cy, from, to) in corners {
+            for step in 0..7 {
+                let angle = from + (to - from) * step as f64 / 6.0;
+                let (dx, dy) = (angle.cos(), angle.sin());
+                let sample = |gap: f64| {
+                    let (x, y) = ((cx + dx * (r + gap)) as usize, (cy + dy * (r + gap)) as usize);
+                    alpha(x, y)
+                };
+                let outside = sample(0.6);
+                let edge = sample(-0.4);
+                assert!(
+                    edge + 6 >= outside,
+                    "the edge at {angle:.2} rad is {edge} against the shadow's {outside}: \
+                     the background shows through"
+                );
+            }
+        }
     }
 
     /// The shadow fades out inside its own margin, so no layer is cut off at the buffer
