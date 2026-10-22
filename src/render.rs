@@ -24,7 +24,7 @@ pub const MAX_CARDS: usize = 4;
 
 /// Space reserved around the panel for its drop shadow, in logical pixels. The buffer
 /// and the layer surface grow by it; the panel keeps its size and screen position.
-pub const SHADOW: u32 = 24;
+pub const SHADOW: u32 = 20;
 
 /// The surface a panel of `w`×`h` needs: the panel plus its shadow margin on every side.
 /// The only place that ratio is defined, so the buffer, the layer surface and the input
@@ -36,8 +36,8 @@ pub const fn surface(w: u32, h: u32) -> (u32, u32) {
 /// Shadow layers as (blur radius, alpha at the panel edge, vertical offset), logical px
 /// and 0-255. A tight contact shadow under a wide ambient one; the offset is positive
 /// because the light comes from above.
-const SHADOW_TIGHT: (u32, u32, u32) = (7, 170, 2);
-const SHADOW_WIDE: (u32, u32, u32) = (17, 130, 6);
+const SHADOW_TIGHT: (u32, u32, u32) = (6, 155, 1);
+const SHADOW_WIDE: (u32, u32, u32) = (13, 115, 4);
 // The margin must fit the widest layer, or its falloff is cut off at the buffer edge.
 const _: () = assert!(SHADOW >= SHADOW_WIDE.0 + SHADOW_WIDE.2);
 
@@ -46,9 +46,17 @@ const _: () = assert!(SHADOW >= SHADOW_WIDE.0 + SHADOW_WIDE.2);
 /// know, but the gap between stacked cards has to clear it.
 pub const SHADOW_REACH_UP: u32 = SHADOW_WIDE.0 - SHADOW_WIDE.2;
 
-/// The hairline's dark underside. Its lit half is the configured border colour, faded
-/// over the height.
+/// The hairline's dark underside: an inner shadow at the bottom edge, fading up into the
+/// sides. Its lit half is the configured border colour, fading down from the top edge.
 const BORDER_DARK_ALPHA: u32 = 60;
+
+/// Where each half of the hairline peaks, as (position down the panel, share of the peak).
+/// The lit half is on top and gone by the lower third; the dark half starts past the middle
+/// and is whole at the bottom edge. Between them the edge carries a little of both, which is
+/// what keeps it visible against the wallpaper without drawing a line around the panel.
+const BORDER_LIT: [(f32, f32); 5] =
+    [(0.0, 1.0), (0.28, 0.62), (0.55, 0.21), (0.85, 0.0), (1.0, 0.0)];
+const BORDER_DARK: [(f32, f32); 4] = [(0.0, 0.0), (0.5, 0.1), (0.82, 0.63), (1.0, 1.0)];
 
 const PAD: f32 = 16.0;
 const RADIUS: f32 = 12.0;
@@ -285,27 +293,40 @@ fn panel(pixels: &mut [u8], width: u32, height: u32, config: &Config, density: u
     );
     let hairline = Stroke { width: stroke_width, ..Stroke::default() };
 
-    // Dark underneath first, then the lit top: it covers the seam where the translucent
-    // body meets the shadow, so the two read as one continuous edge.
-    let mut dark = Paint::default();
-    dark.set_color_rgba8(0, 0, 0, BORDER_DARK_ALPHA as u8);
-    dark.anti_alias = true;
+    // Both halves of the hairline are gradients down the panel: the dark inner shadow at
+    // the bottom is laid first, then the light sheen, which covers the seam where the
+    // translucent body meets the drop shadow.
+    let Some(dark_shader) = LinearGradient::new(
+        Point::from_xy(0.0, x),
+        Point::from_xy(0.0, x + h),
+        BORDER_DARK
+            .iter()
+            .map(|(at, share)| {
+                GradientStop::new(
+                    *at,
+                    Color::from_rgba8(0, 0, 0, (BORDER_DARK_ALPHA as f32 * share).round() as u8),
+                )
+            })
+            .collect(),
+        SpreadMode::Pad,
+        Transform::identity(),
+    ) else {
+        return;
+    };
+    let dark = Paint { shader: dark_shader, anti_alias: true, ..Paint::default() };
     pixmap.stroke_path(&ring, &dark, &hairline, Transform::identity(), None);
 
-    // Lit from above and fading out over the height, so the shadow reads as growing out
-    // of the top edge rather than ringing the panel evenly.
     let ink = config.border.color;
-    let stop = |offset: f32| {
-        let lit = (1.0 - offset).powi(2);
+    let stop = |(at, share): (f32, f32)| {
         GradientStop::new(
-            offset,
-            Color::from_rgba8(ink.0, ink.1, ink.2, (ink.3 as f32 * lit).round() as u8),
+            at,
+            Color::from_rgba8(ink.0, ink.1, ink.2, (ink.3 as f32 * share).round() as u8),
         )
     };
     let Some(shader) = LinearGradient::new(
         Point::from_xy(0.0, x),
         Point::from_xy(0.0, x + h),
-        vec![stop(0.0), stop(1.0 / 3.0), stop(2.0 / 3.0), stop(1.0)],
+        BORDER_LIT.into_iter().map(stop).collect(),
         SpreadMode::Pad,
         Transform::identity(),
     ) else {
@@ -911,22 +932,57 @@ mod tests {
         );
     }
 
-    /// The hairline is lit from above and dark underneath, so the translucent body and the
-    /// shadow read as one edge rather than two surfaces meeting.
+    /// The hairline runs from a lit top edge to a dark inner shadow at the bottom, fading
+    /// through both halves of the gradient on the way down, so the translucent body and the
+    /// shadow read as one edge rather than as two surfaces meeting.
     #[test]
-    fn the_hairline_is_lit_from_above() {
+    fn the_hairline_fades_from_light_to_dark() {
         let (canvas, width, height) = render_with(Config::default(), sample(), 1.0);
         let (w, h) = (width as usize, height as usize);
         let margin = SHADOW as usize;
-        let row = |y: usize| canvas[(y * w + w / 2) * 4];
+        let radius = RADIUS as usize;
+        let grey = |x: usize, y: usize| canvas[(y * w + x) * 4];
 
-        let body = row(margin + 3);
-        let top = row(margin);
-        let bottom = row(h - margin - 1);
-        assert_ne!(top, body, "the top edge is a hairline, not the body");
-        assert_ne!(bottom, body, "and so is the bottom edge");
+        // Down the straight part of the left edge, clear of the corner arcs.
+        let (top_y, bottom_y) = (margin + radius, h - margin - radius);
+        let body = grey(w / 2, (top_y + bottom_y) / 2);
+        let along: Vec<u8> = (0..=7)
+            .map(|step| grey(margin, top_y + (bottom_y - top_y) * step / 7))
+            .collect();
+        let (top, bottom) = (along[0], along[7]);
+
         assert!(top > body, "lit from above: {top} against the body's {body}");
         assert!(bottom < body, "and dark underneath: {bottom} against {body}");
+        assert!(
+            along.windows(2).all(|pair| pair[0] >= pair[1]),
+            "the edge fades one way, top to bottom: {along:?}"
+        );
+        assert!(
+            along[3] > body,
+            "the sides keep a little light, or the edge vanishes into the wallpaper: \
+             {} against {body}",
+            along[3]
+        );
+    }
+
+    /// The shadow fades out inside its own margin, so no layer is cut off at the buffer
+    /// edge — which is what the margin exists for.
+    #[test]
+    fn the_shadow_does_not_reach_the_buffer_edge() {
+        let (canvas, width, height) = render_with(Config::default(), sample(), 1.0);
+        let (w, h) = (width as usize, height as usize);
+        let alpha = |x: usize, y: usize| canvas[(y * w + x) * 4 + 3];
+
+        for x in [0, w - 1] {
+            for y in 0..h {
+                assert_eq!(alpha(x, y), 0, "the buffer's side column is empty at y={y}");
+            }
+        }
+        for y in [0, h - 1] {
+            for x in 0..w {
+                assert_eq!(alpha(x, y), 0, "the buffer's top or bottom row is empty at x={x}");
+            }
+        }
     }
 
     /// A dense output gets a buffer at its own density: the same panel, twice the pixels,

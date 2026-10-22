@@ -46,9 +46,9 @@ const MARGIN: i32 = 32;
 const _: () = assert!(MARGIN >= render::SHADOW as i32);
 /// Space between stacked cards: the visible edge of one panel to the visible edge of the
 /// next. A shadow reaches `SHADOW_REACH_UP` above its panel, so a tighter gap would smear one
-/// card's shadow onto the panel above it. This also holds a whole shadow margin, so the gap
+/// card's shadow onto the panel above it. This also holds most of a shadow margin, so the gap
 /// shows the fade and reads as space rather than as a gutter between two halves of one slab.
-const GAP: i32 = 24;
+const GAP: i32 = 16;
 const _: () = assert!(GAP as u32 > render::SHADOW_REACH_UP);
 /// One animation frame. 60 Hz, which is what the motion was tuned against.
 const FRAME: Duration = Duration::from_millis(16);
