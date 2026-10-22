@@ -23,9 +23,11 @@ position = "top-right"
 # Stroke width in buffer pixels: 1 stays one device pixel thin on a dense output.
 # 0 draws no hairline.
 width = 1.0
-# The hairline's lit ink: solid along the top edge, fading out over the panel height,
-# over a fixed dark underside that joins it to the shadow.
-color = "#ffffff22"
+# The rim's lit ink: at full strength along the top edge and gone by four fifths of the
+# way down, over a fixed dark underside that joins it to the shadow. A dark band one
+# stroke inside the rim is drawn too, so the lit edge reads as glass with thickness
+# rather than as a line drawn on the panel.
+color = "#ffffff5a"
 
 [background]
 # Dark "system" grey, translucent.

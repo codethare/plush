@@ -24,7 +24,7 @@ pub const MAX_CARDS: usize = 4;
 
 /// Space reserved around the panel for its drop shadow, in logical pixels. The buffer
 /// and the layer surface grow by it; the panel keeps its size and screen position.
-pub const SHADOW: u32 = 20;
+pub const SHADOW: u32 = 26;
 
 /// The surface a panel of `w`×`h` needs: the panel plus its shadow margin on every side.
 /// The only place that ratio is defined, so the buffer, the layer surface and the input
@@ -36,8 +36,8 @@ pub const fn surface(w: u32, h: u32) -> (u32, u32) {
 /// Shadow layers as (blur radius, alpha at the panel edge, vertical offset), logical px
 /// and 0-255. A tight contact shadow under a wide ambient one; the offset is positive
 /// because the light comes from above.
-const SHADOW_TIGHT: (u32, u32, u32) = (6, 155, 1);
-const SHADOW_WIDE: (u32, u32, u32) = (13, 115, 4);
+const SHADOW_TIGHT: (u32, u32, u32) = (9, 120, 2);
+const SHADOW_WIDE: (u32, u32, u32) = (20, 95, 6);
 // The margin must fit the widest layer, or its falloff is cut off at the buffer edge.
 const _: () = assert!(SHADOW >= SHADOW_WIDE.0 + SHADOW_WIDE.2);
 
@@ -46,17 +46,29 @@ const _: () = assert!(SHADOW >= SHADOW_WIDE.0 + SHADOW_WIDE.2);
 /// know, but the gap between stacked cards has to clear it.
 pub const SHADOW_REACH_UP: u32 = SHADOW_WIDE.0 - SHADOW_WIDE.2;
 
-/// The hairline's dark underside: an inner shadow at the bottom edge, fading up into the
-/// sides. Its lit half is the configured border colour, fading down from the top edge.
-const BORDER_DARK_ALPHA: u32 = 60;
+/// The rim's dark underside: an inner shadow at the bottom edge, fading up into the sides.
+/// Its lit half is the configured border colour, fading down from the top edge.
+const BORDER_DARK_ALPHA: u32 = 90;
 
-/// Where each half of the hairline peaks, as (position down the panel, share of the peak).
-/// The lit half is on top and gone by the lower third; the dark half starts past the middle
-/// and is whole at the bottom edge. Between them the edge carries a little of both, which is
-/// what keeps it visible against the wallpaper without drawing a line around the panel.
+/// Where each half of the rim peaks, as (position down the panel, share of the peak).
+///
+/// The lit half holds its strength down the top corner arcs and then dies quickly, so it
+/// reads as a specular on glass rather than a wash over the upper half; the dark half stays
+/// out of the way until the lower third and is whole at the bottom edge. Between them the
+/// edge carries a little of both, which is what keeps it visible against the wallpaper
+/// without drawing a line around the panel.
 const BORDER_LIT: [(f32, f32); 5] =
-    [(0.0, 1.0), (0.28, 0.62), (0.55, 0.21), (0.85, 0.0), (1.0, 0.0)];
-const BORDER_DARK: [(f32, f32); 4] = [(0.0, 0.0), (0.5, 0.1), (0.82, 0.63), (1.0, 1.0)];
+    [(0.0, 1.0), (0.16, 0.9), (0.42, 0.55), (0.78, 0.0), (1.0, 0.0)];
+const BORDER_DARK: [(f32, f32); 5] =
+    [(0.0, 0.08), (0.45, 0.15), (0.72, 0.4), (0.9, 0.85), (1.0, 1.0)];
+
+/// The dark band drawn one stroke inside the rim, same shape as the halves above. It is what
+/// makes the lit rim read as the edge of something with thickness: the top of a glass edge
+/// has only the wall below it, so the band starts there at nothing and is whole along the
+/// bottom edge, where the body shadows its own lower wall.
+const BORDER_INNER: [(f32, f32); 5] =
+    [(0.0, 0.0), (0.3, 0.05), (0.6, 0.3), (0.85, 0.8), (1.0, 1.0)];
+const BORDER_INNER_ALPHA: u32 = 130;
 
 const PAD: f32 = 16.0;
 const RADIUS: f32 = 12.0;
@@ -282,58 +294,51 @@ fn panel(pixels: &mut [u8], width: u32, height: u32, config: &Config, density: u
         return;
     }
 
-    // Inset by half the stroke so the whole hairline lands inside the panel.
-    let inset = stroke_width / 2.0;
-    let ring = rounded_rect(
-        x + inset,
-        x + inset,
-        w - stroke_width,
-        h - stroke_width,
-        radius - inset,
-    );
     let hairline = Stroke { width: stroke_width, ..Stroke::default() };
 
-    // Both halves of the hairline are gradients down the panel: the dark inner shadow at
-    // the bottom is laid first, then the light sheen, which covers the seam where the
-    // translucent body meets the drop shadow.
-    let Some(dark_shader) = LinearGradient::new(
-        Point::from_xy(0.0, x),
-        Point::from_xy(0.0, x + h),
-        BORDER_DARK
+    // Three strokes down the panel's height, in the order they are laid: the dark inner
+    // shadow at the bottom edge, the light rim, then the shadowed band just inside it.
+    // Drawn back to front, so the rim covers the seam where the translucent body meets
+    // the drop shadow instead of the other way round.
+    let bg = config.border.color;
+    for (step, curve, peak, ink) in [
+        (0.0, &BORDER_DARK[..], BORDER_DARK_ALPHA, Rgba(0, 0, 0, 0)),
+        (0.0, &BORDER_LIT[..], bg.3 as u32, bg),
+        (stroke_width, &BORDER_INNER[..], BORDER_INNER_ALPHA, Rgba(0, 0, 0, 0)),
+    ] {
+        if peak == 0 {
+            continue;
+        }
+        // `step` is how far in from the rim this stroke's centre runs, in stroke widths.
+        let d = stroke_width + step;
+        let outline = rounded_rect(
+            x + d / 2.0,
+            x + d / 2.0,
+            w - d,
+            h - d,
+            (radius - d / 2.0).max(0.0),
+        );
+        let stops = curve
             .iter()
             .map(|(at, share)| {
                 GradientStop::new(
                     *at,
-                    Color::from_rgba8(0, 0, 0, (BORDER_DARK_ALPHA as f32 * share).round() as u8),
+                    Color::from_rgba8(ink.0, ink.1, ink.2, (peak as f32 * share).round() as u8),
                 )
             })
-            .collect(),
-        SpreadMode::Pad,
-        Transform::identity(),
-    ) else {
-        return;
-    };
-    let dark = Paint { shader: dark_shader, anti_alias: true, ..Paint::default() };
-    pixmap.stroke_path(&ring, &dark, &hairline, Transform::identity(), None);
-
-    let ink = config.border.color;
-    let stop = |(at, share): (f32, f32)| {
-        GradientStop::new(
-            at,
-            Color::from_rgba8(ink.0, ink.1, ink.2, (ink.3 as f32 * share).round() as u8),
-        )
-    };
-    let Some(shader) = LinearGradient::new(
-        Point::from_xy(0.0, x),
-        Point::from_xy(0.0, x + h),
-        BORDER_LIT.into_iter().map(stop).collect(),
-        SpreadMode::Pad,
-        Transform::identity(),
-    ) else {
-        return;
-    };
-    let lit = Paint { shader, anti_alias: true, ..Paint::default() };
-    pixmap.stroke_path(&ring, &lit, &hairline, Transform::identity(), None);
+            .collect();
+        let Some(shader) = LinearGradient::new(
+            Point::from_xy(0.0, x),
+            Point::from_xy(0.0, x + h),
+            stops,
+            SpreadMode::Pad,
+            Transform::identity(),
+        ) else {
+            return;
+        };
+        let paint = Paint { shader, anti_alias: true, ..Paint::default() };
+        pixmap.stroke_path(&outline, &paint, &hairline, Transform::identity(), None);
+    }
 }
 
 /// The panel inside the shadow margin: origin and size in buffer px, plus the rounded
@@ -969,6 +974,32 @@ mod tests {
             "the sides keep a little light, or the edge vanishes into the wallpaper: \
              {} against {body}",
             along[3]
+        );
+    }
+
+    /// A dark band one stroke inside the rim makes the lit edge read as glass with
+    /// thickness rather than as a line drawn on the panel. It is under the bottom edge, where
+    /// the body shadows its own lower wall, and absent at the top, where there is nothing
+    /// above the rim to shadow it.
+    #[test]
+    fn a_dark_band_sits_inside_the_rim_under_the_bottom_edge() {
+        let (canvas, width, height) = render_with(Config::default(), sample(), 1.0);
+        let (w, h) = (width as usize, height as usize);
+        let margin = SHADOW as usize;
+        let radius = RADIUS as usize;
+        let grey = |x: usize, y: usize| canvas[(y * w + x) * 4];
+
+        // One pixel in from the rim, down the straight part of the left edge, clear of the
+        // corner arcs.
+        let (top_y, bottom_y) = (margin + radius, h - margin - radius);
+        let body = grey(w / 2, (top_y + bottom_y) / 2);
+        let near_top = grey(margin + 1, top_y + 2);
+        let darkest = (bottom_y - 8..bottom_y).map(|y| grey(margin + 1, y)).min().unwrap();
+
+        assert_eq!(near_top, body, "nothing shadows the top of the wall: {near_top} vs {body}");
+        assert!(
+            darkest + 4 < body,
+            "the lower wall is in shadow: {darkest} against the body's {body}"
         );
     }
 

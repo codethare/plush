@@ -102,7 +102,7 @@ pub struct Border {
 
 impl Default for Border {
     fn default() -> Self {
-        Self { width: 1.0, color: Rgba(255, 255, 255, 34) }
+        Self { width: 1.0, color: Rgba(255, 255, 255, 90) }
     }
 }
 
@@ -378,7 +378,7 @@ mod tests {
         assert_eq!(bundled, Config::default(), "a missing key must match the bundled value");
 
         assert_eq!(bundled.border.width, 1.0);
-        assert_eq!(bundled.border.color, Rgba(255, 255, 255, 34));
+        assert_eq!(bundled.border.color, Rgba(255, 255, 255, 90));
         assert_eq!(bundled.background.color, Rgba(30, 30, 30, 212));
         assert_eq!(bundled.font.family, "sans-serif");
         assert_eq!(bundled.font.app_metrics(), Metrics::new(11.0, 15.0));
