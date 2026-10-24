@@ -7,10 +7,11 @@
 use cosmic_text::{Attrs, Buffer, FontSystem, Shaping, SwashCache, SwashContent, SwashImage};
 use tiny_skia::{
     Color, FillRule, FilterQuality, GradientStop, LinearGradient, Paint, Path, PathBuilder,
-    Pattern, PixmapMut, PixmapRef, Point, SpreadMode, Stroke, Transform,
+    Pattern, Pixmap, PixmapMut, PixmapPaint, PixmapRef, Point, SpreadMode, Stroke, Transform,
 };
 
 use crate::{
+    anim::Pose,
     config::{Config, Edge, Rgba},
     dbus::{Icon, Notification},
 };
@@ -183,24 +184,17 @@ pub fn card_height(
     ((text + 2.0 * pad).ceil() as u32).clamp((MIN_H * density).max(floor), MAX_H * density)
 }
 
-/// Renders one panel into `canvas`.
+/// Draws one panel at rest into a fresh pixmap: the shadow, the body, its rims, the icon and
+/// the text, in premultiplied RGBA at `scale`.
 ///
-/// `progress` is the card's animation state: 0 is a full side off screen and invisible,
-/// 1 is settled. Which side is the configured position, so a panel on the left slides
-/// right, one on the right slides left, and the centred ones drop in or rise. Cards
-/// drawn with animations turned off pass 1.0.
+/// This is the expensive half of a frame and it is paid once per card. Animation then
+/// composites the result, which is also the only way a card can be scaled: glyphs are blitted
+/// into a byte slice by hand and have no transform of their own.
 ///
-/// An `icon` is drawn in its slot to the left of the text, and arrives with the panel:
-/// it is offset, and faded, with everything else.
-///
-/// `remaining` is how much of the notification's timeout is left, which is the length of
-/// the countdown line; `None` for a notification that never expires, which has no line.
-///
-/// `scale` is the buffer-to-logical density: the buffer is `width`×`height` buffer pixels
-/// and every constant below is logical, so they are multiplied by it here.
+/// `scale` is the buffer-to-logical density: the pixmap is `width`×`height` buffer pixels and
+/// every constant below is logical, so they are multiplied by it here.
 #[allow(clippy::too_many_arguments)]
-pub fn paint(
-    canvas: &mut [u8],
+pub fn rest_frame(
     width: u32,
     height: u32,
     config: &Config,
@@ -208,32 +202,77 @@ pub fn paint(
     font_system: &mut FontSystem,
     swash: &mut SwashCache,
     buffer: &mut Buffer,
-    progress: f32,
-    remaining: Option<f32>,
     scale: u32,
-) {
-    let pixels = &mut canvas[..width as usize * height as usize * 4];
-    let progress = progress.clamp(0.0, 1.0);
+) -> Pixmap {
     let density = scale.max(1);
-
+    let mut frame = Pixmap::new(width, height).expect("plush: a card's buffer fits in memory");
+    let pixels = frame.data_mut();
     panel(pixels, width, height, config, density);
     if let Some(image) = icon {
         draw_icon(pixels, width, height, image, density);
     }
-    if let Some(remaining) = remaining {
-        countdown(pixels, width, height, config, remaining, density);
-    }
     text(pixels, width, height, font_system, swash, buffer, icon.is_some(), density);
+    frame
+}
+
+/// Composites one frame of a card: `frame` is the card at rest, and `pose` is where the
+/// motion currently has it.
+///
+/// The card is scaled about the panel's own centre and then moved along the edge it is
+/// anchored to, so at `travel == 1` it sits entirely outside the buffer and what is left is
+/// clipped at the edge. Chrome, text and icon move together because they are one raster.
+///
+/// `remaining` is how much of the notification's timeout is left, which is the length of the
+/// countdown line; `None` for a notification that never expires, which has no line. The line
+/// is drawn here rather than into `frame` so that it stays live without re-rasterising a
+/// panel, and through the same transform so that it moves with the rest of it.
+#[allow(clippy::too_many_arguments)]
+pub fn paint(
+    canvas: &mut [u8],
+    width: u32,
+    height: u32,
+    frame: PixmapRef,
+    pose: Pose,
+    config: &Config,
+    remaining: Option<f32>,
+    scale: u32,
+) {
+    let pixels = &mut canvas[..width as usize * height as usize * 4];
+    let density = scale.max(1);
+    let Some(mut pixmap) = PixmapMut::from_bytes(pixels, width, height) else {
+        return;
+    };
+    pixmap.fill(Color::TRANSPARENT);
+
+    let transform = pose_transform(&pose, width, height, config);
+    // At rest the frame is copied as it is, which is what every settled repaint is; while it
+    // moves it is resampled, which is what scaling text that has no transform of its own
+    // costs.
+    let quality = if pose.scale == 1.0 && pose.travel == 0.0 {
+        FilterQuality::Nearest
+    } else {
+        FilterQuality::Bilinear
+    };
+    let paint = PixmapPaint { opacity: pose.opacity, quality, ..PixmapPaint::default() };
+    pixmap.draw_pixmap(0, 0, frame, &paint, transform, None);
+
+    if let Some(remaining) = remaining {
+        countdown(&mut pixmap, width, height, config, remaining, density, transform, pose.opacity);
+    }
+
     // wl_shm's Argb8888 is BGRA in memory on little-endian; tiny-skia draws RGBA.
     for pixel in pixels.chunks_exact_mut(4) {
         pixel.swap(0, 2);
     }
+}
 
-    // The card travels its own side, so at progress 0 it sits entirely outside the buffer.
-    // It is drawn at rest inside its shadow margin and then slid out: chrome, text and all
-    // move together, and what leaves the buffer is clipped at the edge.
+/// Where the motion currently has the card: scaled about the panel's centre, then moved along
+/// the configured edge. The panel's centre is the buffer's, because the shadow margin is the
+/// same on every side.
+fn pose_transform(pose: &Pose, width: u32, height: u32, config: &Config) -> Transform {
+    let (cx, cy) = (width as f32 / 2.0, height as f32 / 2.0);
     let edge = config.panel.position.edge();
-    let travel = (1.0 - progress)
+    let travel = pose.travel.clamp(0.0, 1.0)
         * match edge {
             Edge::Left | Edge::Right => width as f32,
             Edge::Top | Edge::Bottom => height as f32,
@@ -244,16 +283,16 @@ pub fn paint(
         Edge::Top => (0.0, -travel),
         Edge::Bottom => (0.0, travel),
     };
-    shift(pixels, width, height, dx.round() as i32, dy.round() as i32);
-    // The buffer is premultiplied, so fading it means scaling every channel alike.
-    if progress < 1.0 {
-        let alpha = (progress * 255.0) as u32;
-        for pixel in pixels.chunks_exact_mut(4) {
-            for channel in pixel.iter_mut() {
-                *channel = (*channel as u32 * alpha / 255) as u8;
-            }
-        }
-    }
+    // Scale about (cx, cy), leaving it where it is, then translate. Written as one row rather
+    // than composed, so the order cannot be read two ways.
+    Transform::from_row(
+        pose.scale,
+        0.0,
+        0.0,
+        pose.scale,
+        cx * (1.0 - pose.scale) + dx,
+        cy * (1.0 - pose.scale) + dy,
+    )
 }
 
 /// The card's chrome: the two shadow layers outside the panel, then its translucent
@@ -477,48 +516,6 @@ fn div255(x: u32) -> u32 {
     (x + 1 + (x >> 8)) >> 8
 }
 
-/// Moves the whole frame by `(dx, dy)` buffer pixels, leaving transparent behind. The card
-/// slides out of its own surface, so whatever leaves the buffer is clipped away.
-fn shift(pixels: &mut [u8], width: u32, height: u32, dx: i32, dy: i32) {
-    let (w, h) = (width as i32, height as i32);
-    if dy >= h || dy <= -h {
-        pixels.fill(0);
-        return;
-    }
-    // Rows first: whole rows move, then the rows they leave are blanked.
-    let pitch = w as usize * 4;
-    let (src, dst) = match dy {
-        1.. => (0..pixels.len() - dy as usize * pitch, dy as usize * pitch),
-        ..=-1 => ((-dy) as usize * pitch..pixels.len(), 0),
-        0 => (0..pixels.len(), 0),
-    };
-    pixels.copy_within(src, dst);
-    let blanked = match dy {
-        1.. => 0..dy as usize * pitch,
-        ..=-1 => pixels.len() - (-dy) as usize * pitch..pixels.len(),
-        0 => 0..0,
-    };
-    pixels[blanked].fill(0);
-
-    for y in 0..h {
-        let row = &mut pixels[y as usize * pitch..(y as usize + 1) * pitch];
-        match dx {
-            dx if dx >= w || dx <= -w => row.fill(0),
-            dx if dx > 0 => {
-                let gap = dx as usize * 4;
-                row.copy_within(0..pitch - gap, gap);
-                row[..gap].fill(0);
-            }
-            dx if dx < 0 => {
-                let gap = (-dx) as usize * 4;
-                row.copy_within(gap..pitch, 0);
-                row[pitch - gap..].fill(0);
-            }
-            _ => {}
-        }
-    }
-}
-
 /// Draws the icon in its slot: scaled to fit, never enlarged, and centred vertically in
 /// the panel. The scaling is a shader, so there is no resampler to keep correct here.
 fn draw_icon(pixels: &mut [u8], width: u32, height: u32, image: &Icon, density: u32) {
@@ -570,21 +567,23 @@ fn rect(x: f32, y: f32, w: f32, h: f32) -> Path {
 ///
 /// It runs between the rounded corners rather than across the whole panel, because a
 /// straight bar in the bottom two rows would otherwise paint over the corner that gets
-/// rounded away.
+/// rounded away. It is drawn through the animation's own `transform` and fades with
+/// `opacity`, so it travels with the panel it belongs to rather than standing still while
+/// the panel moves.
+#[allow(clippy::too_many_arguments)]
 fn countdown(
-    pixels: &mut [u8],
+    pixmap: &mut PixmapMut<'_>,
     width: u32,
     height: u32,
     config: &Config,
     remaining: f32,
     density: u32,
+    transform: Transform,
+    opacity: f32,
 ) {
-    if remaining <= 0.0 {
+    if remaining <= 0.0 || opacity <= 0.0 {
         return;
     }
-    let Some(mut pixmap) = PixmapMut::from_bytes(pixels, width, height) else {
-        return;
-    };
 
     let density = density as f32;
     let margin = SHADOW as f32 * density;
@@ -616,16 +615,10 @@ fn countdown(
         COUNTDOWN_INK.0,
         COUNTDOWN_INK.1,
         COUNTDOWN_INK.2,
-        COUNTDOWN_INK.3,
+        (COUNTDOWN_INK.3 as f32 * opacity.clamp(0.0, 1.0)).round() as u8,
     );
     ink.anti_alias = true;
-    pixmap.fill_path(
-        &rect(x, y, w, h),
-        &ink,
-        FillRule::Winding,
-        Transform::identity(),
-        None,
-    );
+    pixmap.fill_path(&rect(x, y, w, h), &ink, FillRule::Winding, transform, None);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -776,6 +769,12 @@ mod tests {
         render_at(config, sample, progress, 1)
     }
 
+    /// A card part-way through its arrival, without the scale: the travel and the fade are
+    /// what every layout and clipping test is about.
+    fn arriving(progress: f32) -> Pose {
+        Pose { opacity: progress, travel: 1.0 - progress, scale: 1.0 }
+    }
+
     /// The same frame at an output density, for the HiDPI path.
     fn render_at(
         config: Config,
@@ -791,8 +790,7 @@ mod tests {
         let (width, height) = (width * scale, height * scale);
         let mut canvas = vec![0u8; width as usize * height as usize * 4];
         let mut swash = SwashCache::new();
-        paint(
-            &mut canvas,
+        let frame = rest_frame(
             width,
             height,
             &config,
@@ -800,7 +798,15 @@ mod tests {
             &mut font_system,
             &mut swash,
             &mut buffer,
-            progress,
+            scale,
+        );
+        paint(
+            &mut canvas,
+            width,
+            height,
+            frame.as_ref(),
+            arriving(progress),
+            &config,
             None,
             scale,
         );
@@ -809,13 +815,21 @@ mod tests {
 
     /// A panel with a countdown on it and no text, so the line is the only ink on it.
     fn render_countdown(config: Config, remaining: Option<f32>) -> (Vec<u8>, u32, u32) {
+        render_countdown_at(config, remaining, arriving(1.0))
+    }
+
+    /// The same, part-way through the motion.
+    fn render_countdown_at(
+        config: Config,
+        remaining: Option<f32>,
+        pose: Pose,
+    ) -> (Vec<u8>, u32, u32) {
         let mut font_system = FontSystem::new();
         let mut buffer = Buffer::new(&mut font_system, config.font.body_metrics());
         let (width, height) = surface(PANEL_W, MIN_H);
         let mut canvas = vec![0u8; width as usize * height as usize * 4];
         let mut swash = SwashCache::new();
-        paint(
-            &mut canvas,
+        let frame = rest_frame(
             width,
             height,
             &config,
@@ -823,7 +837,15 @@ mod tests {
             &mut font_system,
             &mut swash,
             &mut buffer,
-            1.0,
+            1,
+        );
+        paint(
+            &mut canvas,
+            width,
+            height,
+            frame.as_ref(),
+            pose,
+            &config,
             remaining,
             1,
         );
@@ -1581,6 +1603,50 @@ mod tests {
         assert_eq!(half_left, left, "the left end never moves");
         assert!(half_right < right, "half the timeout is a shorter line");
         assert_eq!(inked_box(&gone.0, gone.1, gone.2), None, "and no line once it is up");
+    }
+
+    /// The line is drawn through the animation's own transform, so it travels with the panel
+    /// it belongs to instead of standing still while the panel moves.
+    #[test]
+    fn the_countdown_line_travels_with_the_panel() {
+        let config = transparent();
+        let still = render_countdown(config.clone(), Some(1.0));
+        // Nearly there: three hundredths of the edge left to travel, which keeps the whole
+        // line inside the panel area the ink box measures.
+        let moving = render_countdown_at(config, Some(1.0), arriving(0.97));
+
+        let (left, right, top, bottom) = inked_box(&still.0, still.1, still.2).expect("the line");
+        let (moved_left, moved_right, moved_top, moved_bottom) =
+            inked_box(&moving.0, moving.1, moving.2).expect("the line, in motion");
+
+        // The default position anchors to the right, so the card arrives travelling left.
+        let shift = (moving.1 as f32 * 0.03).round() as usize;
+        assert!(
+            moved_left.abs_diff(left + shift) <= 1,
+            "the line is {moved_left} where the panel has it at {}",
+            left + shift
+        );
+        assert_eq!(moved_right - moved_left, right - left, "and it keeps its length");
+        assert_eq!(
+            (moved_top, moved_bottom),
+            (top, bottom),
+            "the line travels with the panel, along its edge"
+        );
+    }
+
+    /// The countdown line is composited over the card rather than drawn into it, so the
+    /// padding is what keeps it off the text. Nothing else does.
+    #[test]
+    fn the_countdown_line_cannot_reach_the_text() {
+        let border = Config::default().border.width;
+        for density in 1..=3u32 {
+            let line = COUNTDOWN_H * density as f32 + border;
+            let padding = PAD * density as f32;
+            assert!(
+                line < padding,
+                "at {density}× the line is {line} px into a {padding} px padding"
+            );
+        }
     }
 
     /// The line hugs whichever edge it is configured for: top and bottom run horizontally,

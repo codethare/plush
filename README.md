@@ -84,7 +84,7 @@ place, in which case the bus starts the daemon first and there is then nothing t
 | Expiry | per-notification; `-1` becomes 5000 ms, `0` never expires |
 | Hold | a pointer inside a panel pauses its timeout; leaving resumes with the time that was left |
 | Countdown | a 2 px line along one edge showing how much of the timeout is left — inside the bottom edge unless `[countdown] position` moves it; a notification that never expires has none |
-| Animation | slides in from the nearest edge and fades up over 220 ms; the same motion reversed on the way out |
+| Animation | arrives over 520 ms from the nearest edge, fading up and growing from 96% of its size into a slight overshoot; a panel that expires slides back out over 260 ms, and one that is clicked fades where it stands in 180 ms |
 | `replaces_id` | replaces the content in place and restarts the timeout |
 | Dismiss | pointer press, `CloseNotification`, or `plush dismiss` |
 | Closing reasons | `1` expired, `2` dismissed by user, `3` `CloseNotification` |
@@ -186,12 +186,22 @@ then falls back to a colour-emoji space seventeen pixels wide and leaves a hole 
 
 | Key | Default | |
 |---|---|---|
-| `enabled` | `true` | Slide and fade each panel in from the nearest edge, and back out when it goes away. |
+| `enabled` | `true` | Move and fade each panel in from the nearest edge, and out again when it goes away. |
 
-A panel arrives over 220 ms: it slides in from just past the nearest edge while fading
-up, and eases out so it leaves the edge quickly and settles gently. Which edge that is
-follows `[panel] position`. Dismissing or expiring a panel runs the same motion
-backwards. The duration is fixed; there is no speed setting.
+Arriving and leaving are two different motions, and leaving has two shapes of its own.
+
+A panel arrives over 520 ms: it slides in from just past the nearest edge, fading up and
+growing from 96% of its resting size, overshooting that size by a fraction of a percent
+before it settles. Which edge it comes from follows `[panel] position`.
+
+It leaves by the cheaper of two motions, chosen by what ended it. A panel that expires —
+or that is dropped because the stack is full — slides back out along its edge over 260 ms
+while fading. A panel that is clicked fades where it stands over 180 ms, without
+travelling: the user has already said what they want. Neither departure overshoots or
+changes size. The durations are fixed; there is no speed setting.
+
+The clock starts when the panel has arrived, not when the notification did, so a client's
+timeout is spent with the panel on screen rather than while it is still coming in.
 
 The surface itself never moves. `zwlr_layer_shell_v1` only honours margins on edges you
 have anchored to, and sliding in from off-screen would need a negative margin, which the
@@ -260,6 +270,12 @@ Five consequences worth knowing:
   `configure`, which is the only place its size comes from, and from the frame timer. A frame
   that cannot be painted is retried rather than treated as complete, because a card parked
   halfway through its own fade would stay that way.
+- **A card is rasterised once and composited per frame.** The shadow, the rim, the icon and
+  the text are drawn into a pixmap when the card is first painted, and every frame after that
+  is one transform and one opacity over it. That is also the only way to scale a card: glyphs
+  are blitted into a buffer by hand and have no transform of their own. The countdown line is
+  drawn over the composite rather than into it, so it stays live without re-rasterising
+  anything.
 - **A departing card leaves the stack before it stops moving.** It keeps its place while it
   fades out, so the panels below it close up immediately, and its surface is dropped only
   once the exit has finished.
@@ -321,11 +337,17 @@ end, because `wl_shm`'s `Argb8888` is BGRA in memory while `tiny-skia` paints RG
   rejection of unknown keys, plus tests asserting that a missing file falls back to the
   bundled `data/config.toml`, that a user file overrides it, and that the bundled values are
   still the pre-configuration look.
-- The animation is covered by unit tests for the easing curve and the way progress maps to
-  pixels: nothing is visible at 0, the panel is a half-width to the right at 0.5, and a
-  settled panel is painted exactly as it was before animations existed.
+- The animation is covered by unit tests for each phase's duration and curve, and for the way
+  a pose maps to pixels: nothing is visible at 0, the panel is a half-width to the right at
+  0.5, only the arrival overshoots (by under 1%, and inside the shadow margin it is drawn in),
+  a departure never changes size, and a settled panel is painted exactly as it was before
+  animations existed. A timeout's clock is covered by tests asserting it does not start until
+  the panel has arrived, that a hold taken before then starts nothing, and that the countdown
+  line is at full length while the panel is still coming in.
 - Measured against a headless sway with the protocol traced: 17 ms between frames (60 Hz),
-  roughly 15 frames to arrive and 12 to leave, and with `enabled = false` three paints in
+  roughly 15 frames to arrive and 12 to leave (measured against the 220 ms motion of the
+  time, so the arrival and both departures now run longer — see the animation section), and
+  with `enabled = false` three paints in
   2 ms and a quarter of the CPU for a panel that never expires, against about twenty paints
   a second while a countdown line is draining. Four panels animating at once allocate no
   extra buffers, leak no surfaces, and log no `wl_display` errors.

@@ -27,6 +27,7 @@ use smithay_client_toolkit::{
     },
     shm::{slot::SlotPool, Shm, ShmHandler},
 };
+use tiny_skia::Pixmap;
 use wayland_client::{
     globals::GlobalList,
     protocol::{wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
@@ -34,7 +35,7 @@ use wayland_client::{
 };
 
 use crate::{
-    anim::Anim,
+    anim::{Anim, Exit},
     config::{Column, Config, Position, Row},
     dbus::{CloseRequest, Icon, Notification, Shared, REASON_DISMISSED, REASON_EXPIRED},
     render,
@@ -55,6 +56,17 @@ const FRAME: Duration = Duration::from_millis(16);
 /// One tick of the countdown. 20 Hz, which is enough for the line to read as draining
 /// rather than stepping, and cheap enough to run for the length of a notification.
 const TICK: Duration = Duration::from_millis(50);
+
+/// What a close reason means for the motion. A click is the user asking for the panel to go,
+/// so it leaves without travelling; everything else — a timeout, a full stack, a
+/// `CloseNotification`, a panel the compositor closed — is the panel going away on its own.
+fn exit_for(reason: u32) -> Exit {
+    if reason == REASON_DISMISSED {
+        Exit::Dismissed
+    } else {
+        Exit::Expired
+    }
+}
 
 /// Where the stack is anchored. The centred columns leave both sides free, which is
 /// what makes the compositor centre the surface horizontally.
@@ -131,6 +143,11 @@ struct Card {
     scale: u32,
     timeouts: Timeouts,
     anim: Anim,
+    /// The panel drawn once at rest, in this card's own buffer pixels. Every animation frame
+    /// composites it, and the countdown line is drawn over it. Built on the first draw, which
+    /// is the first frame after the compositor has said how big the card is; it never goes
+    /// stale, because a card that changes size is built again on a fresh surface.
+    frame: Option<Pixmap>,
 }
 
 /// What a card was built from. A change in any of it means the card is rebuilt rather
@@ -166,21 +183,33 @@ impl Source {
 
 /// When a card goes away, and what a hold does to that.
 ///
-/// `timeout` is the client's total, which is the denominator of the countdown; `deadline`
-/// is when the card expires, and is absent both for a card that never expires and for one
-/// being held; `held` is the remaining time a hold froze. Keeping the held time here is
-/// what makes a hold resume with what was left rather than with the client's timeout
+/// `timeout` is the client's total, which is the denominator of the countdown; `pending` is
+/// that same timeout before the card has arrived, when the clock has not started yet;
+/// `deadline` is when the card expires, and is absent both for a card that never expires and
+/// for one being held; `held` is the remaining time a hold froze. Keeping the held time here
+/// is what makes a hold resume with what was left rather than with the client's timeout
 /// again, and it is why `rearm` needs no special case: a held card has no deadline.
 #[derive(Clone, Copy, Debug)]
 struct Timeouts {
     timeout: Option<Duration>,
+    pending: Option<Duration>,
     deadline: Option<Instant>,
     held: Option<Duration>,
 }
 
 impl Timeouts {
-    fn new(timeout: Option<Duration>, now: Instant) -> Self {
-        Self { timeout, deadline: timeout.map(|timeout| now + timeout), held: None }
+    /// A timeout that has not started: it begins when the card has arrived, rather than while
+    /// the panel is still coming in.
+    fn new(timeout: Option<Duration>) -> Self {
+        Self { timeout, pending: timeout, deadline: None, held: None }
+    }
+
+    /// Starts the clock, once the card is on screen and at rest. A card that is already held,
+    /// or that has already started, is left alone.
+    fn start(&mut self, now: Instant) {
+        if let Some(pending) = self.pending.take() {
+            self.deadline = Some(now + pending);
+        }
     }
 
     /// Freezes the countdown where it is. A card that never expires, or one that is
@@ -188,6 +217,9 @@ impl Timeouts {
     fn hold(&mut self, now: Instant) {
         if self.held.is_none() {
             self.held = self.remaining(now);
+            // A card held before it arrived begins its timeout when the hold ends, with the
+            // whole of it: the pointer asked for it not to count down, not to be skipped.
+            self.pending = None;
             self.deadline = None;
         }
     }
@@ -201,6 +233,7 @@ impl Timeouts {
 
     fn remaining(&self, now: Instant) -> Option<Duration> {
         self.held
+            .or(self.pending)
             .or_else(|| self.deadline.map(|deadline| deadline.saturating_duration_since(now)))
     }
 
@@ -323,10 +356,10 @@ impl Ui {
         let now = Instant::now();
         for mut card in std::mem::take(&mut self.cards) {
             match card.anim {
-                Anim::Leaving(_) if !card.leaving_done(now) => ordered.push(card),
-                Anim::Leaving(_) => {}
+                Anim::Leaving(..) if !card.leaving_done(now) => ordered.push(card),
+                Anim::Leaving(..) => {}
                 _ if self.config.animation.enabled => {
-                    card.anim.leave();
+                    card.anim.leave(Exit::Expired);
                     ordered.push(card);
                 }
                 _ => {}
@@ -387,6 +420,18 @@ impl Ui {
         // An initial commit with no buffer; the configure it triggers is what draws.
         card.commit();
 
+        // A card's timeout begins when it has arrived, so none of it is spent while the panel
+        // is still coming in. A card that never animates has already arrived.
+        let anim = if self.config.animation.enabled {
+            Anim::entering()
+        } else {
+            Anim::Settled
+        };
+        let mut timeouts = Timeouts::new(notification.timeout);
+        if anim == Anim::Settled {
+            timeouts.start(Instant::now());
+        }
+
         Card {
             id: notification.id,
             source: Source::of(notification),
@@ -394,18 +439,25 @@ impl Ui {
             content,
             icon: notification.icon.clone(),
             height,
-            timeouts: Timeouts::new(notification.timeout, Instant::now()),
-            anim: if self.config.animation.enabled {
-                Anim::entering()
-            } else {
-                Anim::Settled
-            },
+            timeouts,
+            anim,
+            frame: None,
             size: None,
             scale,
         }
     }
 
     fn remove(&mut self, id: u32, reason: u32) {
+        // What a panel's departure looks like is decided by why it is going away, and this is
+        // the only place that knows. Marking it before `sync` rebuilds the stack is what makes
+        // `sync` keep a card that is already on its way out, rather than leaving it to the
+        // default a card gets when it simply disappears from the queue.
+        let exit = exit_for(reason);
+        if self.config.animation.enabled {
+            if let Some(card) = self.cards.iter_mut().find(|card| card.id == id) {
+                card.anim.leave(exit);
+            }
+        }
         self.store.lock().unwrap().items.retain(|n| n.id != id);
         let _ = self.closed.try_send(CloseRequest { id, reason });
         self.sync();
@@ -487,19 +539,35 @@ impl Ui {
             return false;
         };
 
-        let card = &mut self.cards[index];
         let now = Instant::now();
+        // The rest frame is rasterised once, on the first frame after the compositor has said
+        // how big the card is; every frame after that, moving or not, composites it.
+        if self.cards[index].frame.is_none() {
+            let card = &mut self.cards[index];
+            let frame = render::rest_frame(
+                width,
+                height,
+                &self.config,
+                card.icon.as_ref(),
+                &mut self.font_system,
+                &mut self.swash,
+                &mut card.content,
+                scale,
+            );
+            card.frame = Some(frame);
+        }
+        let card = &mut self.cards[index];
         let remaining = card.timeouts.fraction(now);
+        let Some(frame) = card.frame.as_ref() else {
+            return false;
+        };
         render::paint(
             canvas,
             width,
             height,
+            frame.as_ref(),
+            card.anim.pose(now),
             &self.config,
-            card.icon.as_ref(),
-            &mut self.font_system,
-            &mut self.swash,
-            &mut card.content,
-            card.anim.progress(now),
             remaining,
             scale,
         );
@@ -570,6 +638,7 @@ impl Ui {
     fn frames(&mut self) -> TimeoutAction {
         let now = Instant::now();
         let mut busy = false;
+        let mut started = false;
 
         for index in 0..self.cards.len() {
             match self.cards[index].anim {
@@ -580,11 +649,15 @@ impl Ui {
                     let painted = self.draw(index);
                     if painted && self.cards[index].anim.finished(now) {
                         self.cards[index].anim = Anim::Settled;
+                        // The countdown starts here, not when the notification arrived: the
+                        // client's timeout buys time with the panel on screen and at rest.
+                        self.cards[index].timeouts.start(now);
+                        started = true;
                     } else {
                         busy = true;
                     }
                 }
-                Anim::Leaving(_) => {
+                Anim::Leaving(..) => {
                     // Nothing to paint once it has gone; `retain` below drops it.
                     if !self.cards[index].anim.finished(now) {
                         self.draw(index);
@@ -597,6 +670,11 @@ impl Ui {
         // A departing card that has faded out is dropped here, surface and all. It was
         // already out of the stack, so nothing below it needs re-laying out.
         self.cards.retain(|card| !card.leaving_done(now));
+
+        if started {
+            self.rearm();
+            self.arm_tick();
+        }
 
         if busy {
             TimeoutAction::ToDuration(FRAME)
@@ -914,12 +992,72 @@ mod tests {
         assert_eq!(margins(Position::BottomCenter, 7), (0, 0, edge + 7, 0));
     }
 
+    /// The departure a panel gets is decided by the reason it is going away, not by the panel.
+    #[test]
+    fn the_close_reason_decides_how_the_panel_leaves() {
+        assert_eq!(exit_for(REASON_DISMISSED), Exit::Dismissed, "a click fades");
+        for reason in [REASON_EXPIRED, 3, 99] {
+            assert_eq!(exit_for(reason), Exit::Expired, "reason {reason} slides away");
+        }
+    }
+
+    /// A card's timeout does not start until the panel has arrived: the client's timeout buys
+    /// time with the panel on screen, not time it spends coming in.
+    #[test]
+    fn a_timeout_starts_when_the_panel_has_arrived() {
+        let start = Instant::now();
+        let mut timeouts = Timeouts::new(Some(Duration::from_secs(5)));
+
+        // Still arriving: the whole timeout is left, the line is full, nothing expires.
+        assert_eq!(timeouts.remaining(start), Some(Duration::from_secs(5)));
+        assert_eq!(timeouts.fraction(start), Some(1.0), "the line is at full length");
+        assert!(!timeouts.expired(start + Duration::from_secs(30)));
+
+        // It arrives, and only then does the countdown run.
+        let arrived = start + Duration::from_millis(520);
+        timeouts.start(arrived);
+        assert!(!timeouts.expired(arrived + Duration::from_millis(4999)));
+        assert!(timeouts.expired(arrived + Duration::from_secs(5)));
+        assert_eq!(timeouts.fraction(arrived + Duration::from_millis(2500)), Some(0.5));
+    }
+
+    /// A pointer that arrives before the panel does freezes the whole timeout: the card does
+    /// not start its clock behind the pointer's back, it waits until the hold ends.
+    #[test]
+    fn a_hold_before_the_panel_arrived_starts_nothing() {
+        let held = Instant::now();
+        let mut timeouts = Timeouts::new(Some(Duration::from_secs(5)));
+        timeouts.hold(held);
+        // The arrival finishing while the pointer is still inside starts nothing.
+        timeouts.start(held + Duration::from_millis(520));
+        assert!(!timeouts.expired(held + Duration::from_secs(60)));
+
+        let left = held + Duration::from_secs(3);
+        timeouts.release(left);
+        assert_eq!(timeouts.deadline, Some(left + Duration::from_secs(5)));
+        assert!(!timeouts.expired(left + Duration::from_millis(4999)));
+        assert!(timeouts.expired(left + Duration::from_secs(5)));
+    }
+
+    /// A panel with no timeout never starts one, however it arrived.
+    #[test]
+    fn a_panel_that_never_expires_starts_no_clock() {
+        let now = Instant::now();
+        let mut timeouts = Timeouts::new(None);
+        timeouts.start(now);
+        assert_eq!(timeouts.deadline, None);
+        assert_eq!(timeouts.remaining(now), None);
+        assert_eq!(timeouts.fraction(now), None, "no line to draw");
+        assert!(!timeouts.expired(now + Duration::from_secs(60)));
+    }
+
     /// A hold freezes the countdown; releasing it runs what was left, rather than the
     /// client's timeout over again.
     #[test]
     fn a_hold_resumes_with_the_time_that_was_left() {
         let start = Instant::now();
-        let mut timeouts = Timeouts::new(Some(Duration::from_secs(5)), start);
+        let mut timeouts = Timeouts::new(Some(Duration::from_secs(5)));
+        timeouts.start(start);
         let held = start + Duration::from_secs(2);
 
         timeouts.hold(held);
@@ -939,7 +1077,8 @@ mod tests {
     #[test]
     fn a_hold_never_extends_the_total_timeout() {
         let start = Instant::now();
-        let mut timeouts = Timeouts::new(Some(Duration::from_secs(2)), start);
+        let mut timeouts = Timeouts::new(Some(Duration::from_secs(2)));
+        timeouts.start(start);
 
         timeouts.hold(start + Duration::from_secs(1));
         timeouts.release(start + Duration::from_secs(61));
@@ -954,7 +1093,8 @@ mod tests {
     #[test]
     fn a_hold_on_a_panel_that_never_expires_is_a_no_op() {
         let start = Instant::now();
-        let mut timeouts = Timeouts::new(None, start);
+        let mut timeouts = Timeouts::new(None);
+        timeouts.start(start);
 
         timeouts.hold(start + Duration::from_secs(1));
         timeouts.hold(start + Duration::from_secs(2));
@@ -971,7 +1111,11 @@ mod tests {
     #[test]
     fn the_countdown_is_the_fraction_of_the_timeout_that_is_left() {
         let start = Instant::now();
-        let timeouts = Timeouts::new(Some(Duration::from_millis(4000)), start);
+        let timeouts = {
+            let mut timeouts = Timeouts::new(Some(Duration::from_millis(4000)));
+            timeouts.start(start);
+            timeouts
+        };
 
         assert_eq!(timeouts.fraction(start), Some(1.0));
         assert_eq!(timeouts.fraction(start + Duration::from_secs(1)), Some(0.75));

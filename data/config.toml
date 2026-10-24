@@ -40,7 +40,8 @@ color = "#1e1e1ed4"
 position = "bottom"
 
 [animation]
-# Slide and fade each panel in from the right, and back out when it goes away.
+# Move and fade each panel in from the edge its position is nearest, and out again when it
+# goes away: a timeout slides it back out, a click fades it where it stands.
 # Off makes panels appear and vanish instantly.
 enabled = true
 
