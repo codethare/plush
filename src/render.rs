@@ -16,7 +16,7 @@ use crate::{
 };
 
 /// Panel width in logical pixels.
-pub const PANEL_W: u32 = 380;
+pub const PANEL_W: u32 = 344;
 /// Tallest panel plush will draw; longer bodies are clipped.
 pub const MAX_H: u32 = 320;
 /// Cards kept on screen. Older ones fall off the stack.
@@ -71,8 +71,11 @@ const BORDER_INNER: [(f32, f32); 5] =
 const BORDER_INNER_ALPHA: u32 = 130;
 
 const PAD: f32 = 16.0;
-const RADIUS: f32 = 12.0;
+const RADIUS: f32 = 16.0;
 const MIN_H: u32 = 60;
+/// How many points one corner is walked in. The corner is a curve, not an arc, so it is
+/// sampled; this many keeps the chord error under a twentieth of a pixel at 2× density.
+const CORNER_STEPS: u32 = 12;
 /// The icon slot, and the space between it and the text.
 const ICON: f32 = 32.0;
 const ICON_GAP: f32 = 12.0;
@@ -446,15 +449,27 @@ fn shadow(buf: &mut [u8], w: u32, h: u32, panel: &Panel, density: u32) {
     }
 }
 
-/// Signed distance from a rounded rectangle's outline, given the horizontal and vertical
-/// gaps to where its corner arcs begin: negative inside.
+/// Signed gap between a point and the panel's outline, given the horizontal and vertical
+/// distances past where its corners begin: negative inside.
+///
+/// The corner is a superellipse — `x⁴ + y⁴ = r⁴`, a squircle — so this must be the same
+/// curve `rounded_rect` draws rather than the circle it used to be. A circle bulges out
+/// where the squircle cuts in, and the shadow is gated on this: the corners would get a
+/// dark wedge in the notch the corner no longer covers.
+///
+/// It is no longer a true distance: near the diagonal it is about 15% short of one. The only
+/// reader is the shadow's falloff, which is a 20 px blur against a 16 px radius, so that is
+/// well under a pixel of ink.
 fn outline_gap(qx: f32, qy: f32, radius: f32) -> f32 {
     if qy <= 0.0 {
         qx - radius
     } else if qx <= 0.0 {
         qy - radius
     } else {
-        (qx * qx + qy * qy).sqrt() - radius
+        // An exponent of four is two square roots, on both the sum and the result.
+        let qx2 = qx * qx;
+        let qy2 = qy * qy;
+        (qx2 * qx2 + qy2 * qy2).sqrt().sqrt() - radius
     }
 }
 
@@ -713,24 +728,41 @@ fn blit(
 }
 
 /// Control-point offset that turns a cubic into a quarter circle: `4/3·tan(π/8)`.
-const KAPPA: f32 = 0.552_284_8;
-
-/// A rounded rectangle whose corners are circular arcs, matching the outline the shadow is
-/// measured from. A quadratic through the corner point would pull the corner in by half a
-/// pixel at this radius, leaving a seam between the body and its shadow.
+/// A rounded rectangle whose corners have continuous curvature, matching the outline the
+/// shadow is measured from.
+///
+/// A circular arc jumps from no curvature to `1/r` where it begins, which reads as an arc
+/// bolted onto a rectangle. A squircle — the superellipse `x⁴ + y⁴ = r⁴` — eases into the
+/// turn instead, and is what macOS corners do. It is walked in points rather than drawn as
+/// `cubic_to` arcs: the parametric form is `(r√cos t, r√sin t)`, whose speed runs to
+/// infinity at both ends of the quarter turn, so its curves do not fit a cubic neatly.
+/// Sampling is what keeps the two shapes identical, and there is a test for it.
 fn rounded_rect(x: f32, y: f32, w: f32, h: f32, radius: f32) -> Path {
     let r = radius.max(0.0).min(w / 2.0).min(h / 2.0);
-    let c = r * KAPPA;
     let mut path = PathBuilder::new();
-    path.move_to(x + r, y);
-    path.line_to(x + w - r, y);
-    path.cubic_to(x + w - r + c, y, x + w, y + r - c, x + w, y + r);
-    path.line_to(x + w, y + h - r);
-    path.cubic_to(x + w, y + h - r + c, x + w - r + c, y + h, x + w - r, y + h);
-    path.line_to(x + r, y + h);
-    path.cubic_to(x + r - c, y + h, x, y + h - r + c, x, y + h - r);
-    path.line_to(x, y + r);
-    path.cubic_to(x, y + r - c, x + r - c, y, x + r, y);
+    // Each corner is a quarter turn, clockwise round the rectangle, from the point where the
+    // edge before it ends to the point where the next one begins. Rounded corners on the top
+    // right and bottom left run the turn backwards, which is what `flip` is for.
+    let corners = [
+        (x + w - r, y + r, (1.0, -1.0), true),
+        (x + w - r, y + h - r, (1.0, 1.0), false),
+        (x + r, y + h - r, (-1.0, 1.0), true),
+        (x + r, y + r, (-1.0, -1.0), false),
+    ];
+    for (corner, (cx, cy, (sx, sy), flip)) in corners.into_iter().enumerate() {
+        for step in 0..=CORNER_STEPS {
+            let turn = step as f32 / CORNER_STEPS as f32;
+            let t = if flip { 1.0 - turn } else { turn } * std::f32::consts::FRAC_PI_2;
+            // An exponent of four halves into a square root on each axis.
+            let (dx, dy) = (r * t.cos().abs().sqrt(), r * t.sin().abs().sqrt());
+            let (px, py) = (cx + sx * dx, cy + sy * dy);
+            if corner == 0 && step == 0 {
+                path.move_to(px, py);
+            } else {
+                path.line_to(px, py);
+            }
+        }
+    }
     path.close();
     path.finish().expect("rounded rect is a valid path")
 }
@@ -915,14 +947,16 @@ mod tests {
         let alpha = |x: usize, y: usize| canvas[(y * w + x) * 4 + 3];
 
         let edge = alpha(margin - 4, h / 2);
-        // Four pixels out from the arc, on the diagonal through the corner's centre.
-        let step = (RADIUS as f64 + 4.0) / 2f64.sqrt();
+        // Four pixels out from the corner, on the diagonal through the corner's centre. The
+        // corner is a squircle, so the outline on that diagonal is at `r / ⁴√2` from the
+        // corner's inner corner rather than at `r / √2` as a circular arc would be.
+        let step = (RADIUS as f64 / 2f64.powf(0.25) + 4.0) / 2f64.sqrt();
         let at = (margin as f64 + RADIUS as f64 - step) as usize;
         let corner = alpha(at, at);
 
         assert!(corner > 0, "the corner has no shadow at all");
         assert!(
-            corner * 3 >= edge,
+            u16::from(corner) * 3 >= u16::from(edge),
             "the corner carries {corner} against the edge's {edge}"
         );
     }
@@ -1017,7 +1051,8 @@ mod tests {
         let r = RADIUS as f64;
         let alpha = |x: usize, y: usize| canvas[(y * w + x) * 4 + 3] as i32;
 
-        // (corner centre, the arc's angular range) — screen coordinates, y down.
+        // (corner centre, the corner's angular range) — screen coordinates, y down. The
+        // centre is where the squircle's two straight edges would meet.
         let corners = [
             (margin + r, margin + r, PI, 1.5 * PI),
             (w as f64 - margin - r, margin + r, 1.5 * PI, 2.0 * PI),
@@ -1028,8 +1063,14 @@ mod tests {
             for step in 0..7 {
                 let angle = from + (to - from) * step as f64 / 6.0;
                 let (dx, dy) = (angle.cos(), angle.sin());
+                // Where the squircle's outline crosses this direction: `|x|⁴ + |y|⁴ = r⁴`
+                // scaled along the unit vector.
+                let outline = r / (dx.powi(4) + dy.powi(4)).powf(0.25);
                 let sample = |gap: f64| {
-                    let (x, y) = ((cx + dx * (r + gap)) as usize, (cy + dy * (r + gap)) as usize);
+                    let (x, y) = (
+                        (cx + dx * (outline + gap)) as usize,
+                        (cy + dy * (outline + gap)) as usize,
+                    );
                     alpha(x, y)
                 };
                 let outside = sample(0.6);
@@ -1060,6 +1101,83 @@ mod tests {
             for x in 0..w {
                 assert_eq!(alpha(x, y), 0, "the buffer's top or bottom row is empty at x={x}");
             }
+        }
+    }
+
+    /// The body is exactly `PANEL_W` logical pixels wide whatever the density, and it sits
+    /// inside its shadow margin with nothing lit outside it but the shadow itself.
+    #[test]
+    fn the_body_is_panel_wide_whatever_the_density() {
+        for (density, expected) in [(1u32, PANEL_W as usize), (2, 2 * PANEL_W as usize)] {
+            let (canvas, width, height) = render_at(Config::default(), sample(), 1.0, density);
+            let (w, h) = (width as usize, height as usize);
+            let margin = SHADOW as usize * density as usize;
+            let mid = h / 2;
+            let grey = |x: usize| canvas[(mid * w + x) * 4];
+            let alpha = |x: usize| canvas[(mid * w + x) * 4 + 3];
+
+            assert!(grey(margin) > 0, "the body starts at its margin, density {density}");
+            assert!(
+                grey(margin + expected - 1) > 0,
+                "the body is {expected} px wide, density {density}"
+            );
+            assert_eq!(grey(margin - 1), 0, "nothing lit outside the body");
+            assert!(alpha(margin - 1) > 0, "but its shadow is there");
+            assert_eq!(grey(margin + expected), 0, "and the body stops at its width");
+        }
+    }
+
+    /// A corner is a squircle, not a circular arc: on the diagonal it reaches further out
+    /// than an arc of the same radius would, and it still rounds the corner away rather than
+    /// squaring it off. Those two bracket the shape — one rejects an arc, the other a box.
+    ///
+    /// Drawn with a transparent body and no rim, the shadow is the only ink, so its hole is
+    /// the outline: empty means inside the body, inked means outside it.
+    #[test]
+    fn a_corner_has_continuous_curvature() {
+        let (canvas, width, height) = render_with(transparent(), sample(), 1.0);
+        let (w, h) = (width as usize, height as usize);
+        let margin = SHADOW as usize;
+        let alpha = |x: usize, y: usize| canvas[(y * w + x) * 4 + 3];
+
+        // 0.24 of the radius in from both edges is 0.76r along each axis: past the 0.707r
+        // an arc of this radius sits at, short of the 0.84r this corner reaches.
+        let inset = (RADIUS * 0.24) as usize;
+        let (left, top) = (margin + inset, margin + inset);
+        let (right, bottom) = (w - 1 - margin - inset, h - 1 - margin - inset);
+        for (x, y) in [(left, top), (right, top), (left, bottom), (right, bottom)] {
+            assert_eq!(
+                alpha(x, y),
+                0,
+                "corner ({x},{y}) is inside the body: no shadow may be painted under it"
+            );
+        }
+
+        // The corner box's outer corner is still cut away, which a squared corner would not be.
+        for (x, y) in [(margin, margin), (w - 1 - margin, h - 1 - margin)] {
+            assert!(alpha(x, y) > 0, "corner ({x},{y}) must stay rounded away");
+        }
+    }
+
+    /// The gap the shadow is measured from is zero on the outline the corner draws, and grows
+    /// outwards from it: the two can only be the same curve if they agree at every angle.
+    #[test]
+    fn the_gap_is_measured_to_the_corner_the_outline_draws() {
+        let r = RADIUS;
+        for step in 0..=8 {
+            let t = step as f32 / 8.0 * std::f32::consts::FRAC_PI_2;
+            // The corner's parametric form in the shadow's own terms: how far past the
+            // straight edges the outline runs at this angle.
+            let (qx, qy) = (r * t.cos().abs().sqrt(), r * t.sin().abs().sqrt());
+            let gap = outline_gap(qx, qy, r);
+            assert!(gap.abs() < 0.01, "on the outline at t={t:.2}: gap {gap}");
+
+            let outside = outline_gap(qx + 0.5, qy + 0.5, r);
+            assert!(outside > 0.4, "a half pixel out at t={t:.2}: gap {outside}");
+            assert!(
+                outline_gap(qx + 2.0, qy + 2.0, r) > outside,
+                "and it keeps growing at t={t:.2}"
+            );
         }
     }
 

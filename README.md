@@ -76,7 +76,7 @@ place, in which case the bus starts the daemon first and there is then nothing t
 | | |
 |---|---|
 | Position | `top-right` by default; 32 px inside the edge it is anchored to, and clear of anything a bar or a dock has claimed there; the drop shadow lives inside that gap |
-| Panel | 380 px wide, 12 px corner radius, 16 px padding, a drop shadow, and a rim that runs from a lit top edge to a dark inner shadow at the bottom, with a dark band just inside it |
+| Panel | 344 px wide, 16 px corner radius with continuous curvature, 16 px padding, a drop shadow, and a rim that runs from a lit top edge to a dark inner shadow at the bottom, with a dark band just inside it |
 | Dense output | drawn at the output's integer scale, so the panel keeps its logical size and its pixels are the output's own; fractional scaling uses the integer scale the compositor reports |
 | Icon | the `image-data` hint, fitted into a 32 px slot to the left of the text and never enlarged; `image-path` and `app_icon` are ignored |
 | Stack | up to 4 panels, 16 px apart, newest on top |
