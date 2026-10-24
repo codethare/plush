@@ -135,8 +135,8 @@ fn run_daemon() {
 
     let connection =
         Connection::connect_to_env().expect("plush: no Wayland compositor in this session");
-    let (globals, event_queue) =
-        registry_queue_init::<ui::Ui>(&connection).expect("plush: could not read the Wayland registry");
+    let (globals, event_queue) = registry_queue_init::<ui::Ui>(&connection)
+        .expect("plush: could not read the Wayland registry");
 
     let qh = event_queue.handle();
     let compositor =
@@ -182,9 +182,7 @@ fn run_daemon() {
     );
     ui.sync();
 
-    event_loop
-        .run(None::<Duration>, &mut ui, |_| {})
-        .expect("plush: event loop failed");
+    event_loop.run(None::<Duration>, &mut ui, |_| {}).expect("plush: event loop failed");
 }
 
 #[cfg(test)]

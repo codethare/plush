@@ -152,10 +152,8 @@ pub fn build(
         }
     }
 
-    let spans: Vec<(&str, Attrs)> = parts
-        .iter()
-        .map(|(text, attrs)| (text.as_str(), attrs.clone()))
-        .collect();
+    let spans: Vec<(&str, Attrs)> =
+        parts.iter().map(|(text, attrs)| (text.as_str(), attrs.clone())).collect();
     buffer.set_rich_text(
         spans,
         &Attrs::new().family(font.family()).metrics(font.body_metrics().scale(density)),
@@ -353,13 +351,8 @@ fn panel(pixels: &mut [u8], width: u32, height: u32, config: &Config, density: u
         }
         // `step` is how far in from the rim this stroke's centre runs, in stroke widths.
         let d = stroke_width + step;
-        let outline = rounded_rect(
-            x + d / 2.0,
-            x + d / 2.0,
-            w - d,
-            h - d,
-            (radius - d / 2.0).max(0.0),
-        );
+        let outline =
+            rounded_rect(x + d / 2.0, x + d / 2.0, w - d, h - d, (radius - d / 2.0).max(0.0));
         let stops = curve
             .iter()
             .map(|(at, share)| {
@@ -398,19 +391,20 @@ struct Panel {
 /// the band the layers can reach is touched.
 fn shadow(buf: &mut [u8], w: u32, h: u32, panel: &Panel, density: u32) {
     // (blur, vertical offset, alpha by squared distance)
-    let layers: [(u32, i64, Vec<u32>); 2] = [SHADOW_WIDE, SHADOW_TIGHT].map(|(blur, a0, offset)| {
-        let b = (blur * density).max(1);
-        let offset = (offset * density) as i64;
-        let lut = (0..=b * b)
-            .map(|d2| {
-                // A blurred edge starts at half the peak and eases out: a ramp from the
-                // full value leaves a visible cusp where it begins.
-                let t = (d2 as f64).sqrt() / b as f64;
-                (a0 as f64 * 0.5 * (1.0 + (std::f64::consts::PI * t).cos())).round() as u32
-            })
-            .collect();
-        (b, offset, lut)
-    });
+    let layers: [(u32, i64, Vec<u32>); 2] =
+        [SHADOW_WIDE, SHADOW_TIGHT].map(|(blur, a0, offset)| {
+            let b = (blur * density).max(1);
+            let offset = (offset * density) as i64;
+            let lut = (0..=b * b)
+                .map(|d2| {
+                    // A blurred edge starts at half the peak and eases out: a ramp from the
+                    // full value leaves a visible cusp where it begins.
+                    let t = (d2 as f64).sqrt() / b as f64;
+                    (a0 as f64 * 0.5 * (1.0 + (std::f64::consts::PI * t).cos())).round() as u32
+                })
+                .collect();
+            (b, offset, lut)
+        });
     let reach = layers.iter().map(|l| l.0).max().unwrap_or(1);
     let drop = layers.iter().map(|l| l.1.max(0) as u32).max().unwrap_or(0);
 
@@ -542,13 +536,7 @@ fn draw_icon(pixels: &mut [u8], width: u32, height: u32, image: &Icon, density: 
         ),
         ..Default::default()
     };
-    pixmap.fill_path(
-        &rect(x, y, w, h),
-        &paint,
-        FillRule::Winding,
-        Transform::identity(),
-        None,
-    );
+    pixmap.fill_path(&rect(x, y, w, h), &paint, FillRule::Winding, Transform::identity(), None);
 }
 
 /// An axis-aligned rectangle, which is all an icon slot needs.
@@ -642,10 +630,8 @@ fn text(
             let Some(color) = glyph.color_opt else {
                 continue;
             };
-            let origin = glyph.physical(
-                (margin + inset, margin + PAD * density as f32 + run.line_y),
-                1.0,
-            );
+            let origin =
+                glyph.physical((margin + inset, margin + PAD * density as f32 + run.line_y), 1.0);
             let Some(image) = swash.get_image(font_system, origin.cache_key) else {
                 continue;
             };
@@ -696,12 +682,7 @@ fn blit(
                     // swash hands back premultiplied RGBA here.
                     let offset = index * 4;
                     let a = image.data[offset + 3] as u32 * alpha as u32 / 255;
-                    (
-                        image.data[offset],
-                        image.data[offset + 1],
-                        image.data[offset + 2],
-                        a as u8,
-                    )
+                    (image.data[offset], image.data[offset + 1], image.data[offset + 2], a as u8)
                 }
                 SwashContent::SubpixelMask => continue,
             };
@@ -800,16 +781,7 @@ mod tests {
             &mut buffer,
             scale,
         );
-        paint(
-            &mut canvas,
-            width,
-            height,
-            frame.as_ref(),
-            arriving(progress),
-            &config,
-            None,
-            scale,
-        );
+        paint(&mut canvas, width, height, frame.as_ref(), arriving(progress), &config, None, scale);
         (canvas, width, height)
     }
 
@@ -829,26 +801,9 @@ mod tests {
         let (width, height) = surface(PANEL_W, MIN_H);
         let mut canvas = vec![0u8; width as usize * height as usize * 4];
         let mut swash = SwashCache::new();
-        let frame = rest_frame(
-            width,
-            height,
-            &config,
-            None,
-            &mut font_system,
-            &mut swash,
-            &mut buffer,
-            1,
-        );
-        paint(
-            &mut canvas,
-            width,
-            height,
-            frame.as_ref(),
-            pose,
-            &config,
-            remaining,
-            1,
-        );
+        let frame =
+            rest_frame(width, height, &config, None, &mut font_system, &mut swash, &mut buffer, 1);
+        paint(&mut canvas, width, height, frame.as_ref(), pose, &config, remaining, 1);
         (canvas, width, height)
     }
 
@@ -931,9 +886,7 @@ mod tests {
             assert!(alpha < 40, "corner ({x},{y}) must be rounded away, alpha={alpha}");
         }
         assert!(
-            canvas
-                .chunks_exact(4)
-                .any(|p| p[0] > 200 && p[1] > 200 && p[2] > 200),
+            canvas.chunks_exact(4).any(|p| p[0] > 200 && p[1] > 200 && p[2] > 200),
             "panel must contain light text pixels"
         );
     }
@@ -1014,9 +967,8 @@ mod tests {
         // Down the straight part of the left edge, clear of the corner arcs.
         let (top_y, bottom_y) = (margin + radius, h - margin - radius);
         let body = grey(w / 2, (top_y + bottom_y) / 2);
-        let along: Vec<u8> = (0..=7)
-            .map(|step| grey(margin, top_y + (bottom_y - top_y) * step / 7))
-            .collect();
+        let along: Vec<u8> =
+            (0..=7).map(|step| grey(margin, top_y + (bottom_y - top_y) * step / 7)).collect();
         let (top, bottom) = (along[0], along[7]);
 
         assert!(top > body, "lit from above: {top} against the body's {body}");
@@ -1224,9 +1176,7 @@ mod tests {
             assert_eq!(alpha(x, y), 0, "corner ({x},{y}) stays empty");
         }
         assert!(
-            canvas
-                .chunks_exact(4)
-                .any(|pixel| pixel[0] > 200 && pixel[1] > 200 && pixel[2] > 200),
+            canvas.chunks_exact(4).any(|pixel| pixel[0] > 200 && pixel[1] > 200 && pixel[2] > 200),
             "the text is rasterised at the buffer density"
         );
     }
@@ -1244,11 +1194,7 @@ mod tests {
             let row = |y: usize| canvas[(y * w + w / 2) * 4];
             let body = row(margin + 3 * scale as usize);
             assert_ne!(row(margin), body, "scale {scale}: the top edge is a hairline");
-            assert_eq!(
-                row(margin + 1),
-                body,
-                "scale {scale}: and it is one physical pixel thin"
-            );
+            assert_eq!(row(margin + 1), body, "scale {scale}: and it is one physical pixel thin");
         }
     }
 
@@ -1352,8 +1298,8 @@ mod tests {
             let config: Config =
                 toml::from_str(&format!("[panel]\nposition = {name:?}\n")).expect(name);
             let (canvas, width, height) = render_with(config, sample(), 0.5);
-            let (left, right, top, bottom) =
-                inked_box(&canvas, width, height).unwrap_or_else(|| panic!("{name}: nothing painted"));
+            let (left, right, top, bottom) = inked_box(&canvas, width, height)
+                .unwrap_or_else(|| panic!("{name}: nothing painted"));
             let (last_col, last_row) = (
                 width as usize - 2 * SHADOW as usize - 1,
                 height as usize - 2 * SHADOW as usize - 1,
@@ -1382,14 +1328,9 @@ mod tests {
 
     #[test]
     fn no_position_is_visible_before_it_arrives() {
-        for name in [
-            "top-left",
-            "bottom-left",
-            "top-center",
-            "bottom-center",
-            "top-right",
-            "bottom-right",
-        ] {
+        for name in
+            ["top-left", "bottom-left", "top-center", "bottom-center", "top-right", "bottom-right"]
+        {
             let config: Config =
                 toml::from_str(&format!("[panel]\nposition = {name:?}\n")).expect(name);
             let (canvas, ..) = render_with(config, sample(), 0.0);
@@ -1427,10 +1368,9 @@ mod tests {
 
     #[test]
     fn configured_colours_and_border_reach_the_pixels() {
-        let plain: Config = toml::from_str(
-            "[background]\ncolor = \"#ff0000ff\"\n\n[border]\nwidth = 0.0\n",
-        )
-        .unwrap();
+        let plain: Config =
+            toml::from_str("[background]\ncolor = \"#ff0000ff\"\n\n[border]\nwidth = 0.0\n")
+                .unwrap();
         let (canvas, width, height) = render_with(plain, sample(), 1.0);
         let (w, h) = (width as usize, height as usize);
 
@@ -1511,7 +1451,8 @@ mod tests {
     /// The slot is drawn where the text was moved from, and in the icon's own colour.
     #[test]
     fn the_icon_is_drawn_in_the_slot_beside_the_text() {
-        let (canvas, width, height) = render_with(transparent(), with_icon(solid_icon(64, 64, [255, 0, 0, 255])), 1.0);
+        let (canvas, width, height) =
+            render_with(transparent(), with_icon(solid_icon(64, 64, [255, 0, 0, 255])), 1.0);
         let (w, h) = (width as usize, height as usize);
         let (_, right, top, bottom) = inked_box(&canvas, width, height).expect("ink");
 
@@ -1528,7 +1469,8 @@ mod tests {
     /// The icon is centred in the panel, however tall the panel is for the text.
     #[test]
     fn the_icon_is_centred_vertically_in_the_panel() {
-        let (canvas, width, height) = render_with(transparent(), with_icon(solid_icon(32, 32, [255, 0, 0, 255])), 1.0);
+        let (canvas, width, height) =
+            render_with(transparent(), with_icon(solid_icon(32, 32, [255, 0, 0, 255])), 1.0);
         let (w, h) = (width as usize, height as usize);
         let margin = SHADOW as usize;
         let top = (height - 2 * SHADOW - 32) / 2;
@@ -1731,17 +1673,12 @@ mod tests {
             .map(|(pixel, _)| pixel / w)
             .collect();
         rows.dedup();
-        let top = h
-            - SHADOW as usize
-            - Config::default().border.width as usize
-            - COUNTDOWN_H as usize;
+        let top =
+            h - SHADOW as usize - Config::default().border.width as usize - COUNTDOWN_H as usize;
         assert_eq!(rows, vec![top, top + 1], "the line sits above the hairline");
 
         for (x, y) in [(0usize, h - 1), (w - 1, h - 1), (0, 0), (w - 1, 0)] {
-            assert!(
-                lined.0[(y * w + x) * 4 + 3] < 40,
-                "corner ({x},{y}) must stay rounded away"
-            );
+            assert!(lined.0[(y * w + x) * 4 + 3] < 40, "corner ({x},{y}) must stay rounded away");
         }
     }
 }

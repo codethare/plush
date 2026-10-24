@@ -314,7 +314,10 @@ mod tests {
             assert!(!anim.finished(start + duration / 2), "{exit:?} is not over early");
 
             // And it is shorter than the arrival: a departure gets out of the way.
-            assert!(duration < ENTER, "{exit:?} takes {duration:?} against the arrival's {ENTER:?}");
+            assert!(
+                duration < ENTER,
+                "{exit:?} takes {duration:?} against the arrival's {ENTER:?}"
+            );
         }
     }
 

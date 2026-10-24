@@ -115,12 +115,7 @@ fn size_card(compositor: &CompositorState, surface: &LayerSurface, height: u32) 
     surface.set_size(width, surface_height);
 
     let region = Region::new(compositor).expect("plush: wl_compositor is bound");
-    region.add(
-        render::SHADOW as i32,
-        render::SHADOW as i32,
-        render::PANEL_W as i32,
-        height as i32,
-    );
+    region.add(render::SHADOW as i32, render::SHADOW as i32, render::PANEL_W as i32, height as i32);
     surface.set_input_region(Some(region.wl_region()));
 }
 
@@ -422,11 +417,7 @@ impl Ui {
 
         // A card's timeout begins when it has arrived, so none of it is spent while the panel
         // is still coming in. A card that never animates has already arrived.
-        let anim = if self.config.animation.enabled {
-            Anim::entering()
-        } else {
-            Anim::Settled
-        };
+        let anim = if self.config.animation.enabled { Anim::entering() } else { Anim::Settled };
         let mut timeouts = Timeouts::new(notification.timeout);
         if anim == Anim::Settled {
             timeouts.start(Instant::now());
@@ -478,11 +469,7 @@ impl Ui {
             self.rearm();
             return;
         }
-        self.store
-            .lock()
-            .unwrap()
-            .items
-            .retain(|n| !expired.contains(&n.id));
+        self.store.lock().unwrap().items.retain(|n| !expired.contains(&n.id));
         for id in expired {
             let _ = self.closed.try_send(CloseRequest { id, reason: REASON_EXPIRED });
         }
@@ -530,12 +517,9 @@ impl Ui {
         let scale = self.cards[index].scale;
         let (width, height) = (logical_w * scale, logical_h * scale);
         let stride = width as i32 * 4;
-        let Ok((buffer, canvas)) = self.pool.create_buffer(
-            width as i32,
-            height as i32,
-            stride,
-            wl_shm::Format::Argb8888,
-        ) else {
+        let Ok((buffer, canvas)) =
+            self.pool.create_buffer(width as i32, height as i32, stride, wl_shm::Format::Argb8888)
+        else {
             return false;
         };
 
@@ -585,10 +569,7 @@ impl Ui {
     /// before a single buffer is attached.
     fn apply_scale(&mut self, surface: &wl_surface::WlSurface, scale: i32) {
         let scale = scale.max(1) as u32;
-        let Some(index) = self
-            .cards
-            .iter()
-            .position(|card| card.surface.wl_surface() == surface)
+        let Some(index) = self.cards.iter().position(|card| card.surface.wl_surface() == surface)
         else {
             return;
         };
@@ -690,10 +671,7 @@ impl Ui {
     /// nothing left to hold.
     fn hold(&mut self, id: u32) {
         let now = Instant::now();
-        if let Some(card) = self
-            .cards
-            .iter_mut()
-            .find(|card| card.id == id && !card.anim.leaving())
+        if let Some(card) = self.cards.iter_mut().find(|card| card.id == id && !card.anim.leaving())
         {
             card.timeouts.hold(now);
         }
@@ -706,10 +684,7 @@ impl Ui {
     /// been announced as closed, and giving it a deadline again would announce it twice.
     fn release(&mut self, id: u32) {
         let now = Instant::now();
-        if let Some(card) = self
-            .cards
-            .iter_mut()
-            .find(|card| card.id == id && !card.anim.leaving())
+        if let Some(card) = self.cards.iter_mut().find(|card| card.id == id && !card.anim.leaving())
         {
             card.timeouts.release(now);
         }
@@ -729,9 +704,7 @@ impl Ui {
 
     /// Whether any card on screen has a countdown running.
     fn draining(&self) -> bool {
-        self.cards
-            .iter()
-            .any(|card| !card.anim.leaving() && card.timeouts.deadline.is_some())
+        self.cards.iter().any(|card| !card.anim.leaving() && card.timeouts.deadline.is_some())
     }
 
     /// One countdown tick: repaint the cards whose line is draining. A card that is still
@@ -794,10 +767,7 @@ impl CompositorHandler for Ui {
         surface: &wl_surface::WlSurface,
         output: &wl_output::WlOutput,
     ) {
-        let scale = self
-            .output_state
-            .info(output)
-            .map_or(1, |info| info.scale_factor);
+        let scale = self.output_state.info(output).map_or(1, |info| info.scale_factor);
         self.apply_scale(surface, scale);
     }
 
@@ -816,7 +786,12 @@ impl OutputHandler for Ui {
         &mut self.output_state
     }
 
-    fn new_output(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _output: wl_output::WlOutput) {
+    fn new_output(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _output: wl_output::WlOutput,
+    ) {
     }
 
     fn update_output(
@@ -838,11 +813,7 @@ impl OutputHandler for Ui {
 
 impl LayerShellHandler for Ui {
     fn closed(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, layer: &LayerSurface) {
-        if let Some(id) = self
-            .cards
-            .iter()
-            .find(|card| &card.surface == layer)
-            .map(|card| card.id)
+        if let Some(id) = self.cards.iter().find(|card| &card.surface == layer).map(|card| card.id)
         {
             self.remove(id, REASON_EXPIRED);
         }
@@ -1062,12 +1033,18 @@ mod tests {
 
         timeouts.hold(held);
         assert!(!timeouts.expired(held + Duration::from_secs(30)));
-        assert_eq!(timeouts.remaining(held + Duration::from_secs(30)), Some(Duration::from_secs(3)));
+        assert_eq!(
+            timeouts.remaining(held + Duration::from_secs(30)),
+            Some(Duration::from_secs(3))
+        );
         assert_eq!(timeouts.fraction(held + Duration::from_secs(30)), Some(0.6));
 
         timeouts.release(held + Duration::from_secs(30));
         assert_eq!(timeouts.deadline, Some(held + Duration::from_secs(33)));
-        assert_eq!(timeouts.remaining(held + Duration::from_secs(31)), Some(Duration::from_secs(2)));
+        assert_eq!(
+            timeouts.remaining(held + Duration::from_secs(31)),
+            Some(Duration::from_secs(2))
+        );
         assert!(!timeouts.expired(held + Duration::from_secs(32)));
         assert!(timeouts.expired(held + Duration::from_secs(33)));
     }

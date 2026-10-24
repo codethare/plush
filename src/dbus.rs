@@ -87,11 +87,8 @@ fn icon_from(hints: &Hints) -> Option<Icon> {
     let Value::Array(data) = data else {
         return None;
     };
-    let data: Vec<u8> = data
-        .inner()
-        .iter()
-        .map(|byte| byte.downcast_ref::<u8>().ok())
-        .collect::<Option<_>>()?;
+    let data: Vec<u8> =
+        data.inner().iter().map(|byte| byte.downcast_ref::<u8>().ok()).collect::<Option<_>>()?;
 
     let (width, height, stride, channels) =
         (width as usize, height as usize, stride as usize, channels as usize);
@@ -253,10 +250,7 @@ impl Notifications {
                 store.next_id
             };
             store.items.retain(|n| n.id != id);
-            store.items.insert(
-                0,
-                Notification { id, app_name, summary, body, timeout, icon },
-            );
+            store.items.insert(0, Notification { id, app_name, summary, body, timeout, icon });
             id
         };
 
@@ -383,9 +377,8 @@ mod tests {
         control.dismiss_all();
 
         assert!(ids(&store).is_empty());
-        let announced: Vec<u32> = std::iter::from_fn(|| requests.try_recv().ok())
-            .map(|request| request.id)
-            .collect();
+        let announced: Vec<u32> =
+            std::iter::from_fn(|| requests.try_recv().ok()).map(|request| request.id).collect();
         assert_eq!(announced.len(), 3, "every notification is announced");
         assert!(announced.contains(&1) && announced.contains(&2) && announced.contains(&3));
     }
@@ -414,9 +407,8 @@ mod tests {
         channels: i32,
         data: Vec<u8>,
     ) -> Hints {
-        let structure = zvariant::Structure::from((
-            width, height, stride, has_alpha, bits, channels, data,
-        ));
+        let structure =
+            zvariant::Structure::from((width, height, stride, has_alpha, bits, channels, data));
         hints("image-data", Value::Structure(structure))
     }
 
@@ -490,7 +482,8 @@ mod tests {
                 hints("image-data", Value::Structure(structure))
             }),
             ("a data array that is not bytes", {
-                let structure = zvariant::Structure::from((1, 1, 4, true, 8, 4, vec![1i32, 2, 3, 4]));
+                let structure =
+                    zvariant::Structure::from((1, 1, 4, true, 8, 4, vec![1i32, 2, 3, 4]));
                 hints("image-data", Value::Structure(structure))
             }),
             ("16 bits per sample", image_data(1, 1, 8, true, 16, 4, good())),
@@ -534,11 +527,8 @@ mod tests {
 
         let items = store.lock().unwrap();
         let with_icon = items.items.iter().find(|n| n.id == id).expect("the first notification");
-        let without = items
-            .items
-            .iter()
-            .find(|n| n.id == id_without_icon)
-            .expect("the second notification");
+        let without =
+            items.items.iter().find(|n| n.id == id_without_icon).expect("the second notification");
         assert_eq!(with_icon.icon.as_ref().map(|icon| icon.rgba.clone()), Some(vec![3, 2, 1, 4]));
         assert_eq!(without.icon, None, "an unreadable hint leaves a text-only panel");
         assert_eq!(without.summary, "summary", "and the notification is still there");

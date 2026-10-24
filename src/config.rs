@@ -30,9 +30,7 @@ impl<'de> Deserialize<'de> for Rgba {
 }
 
 fn parse_color(raw: &str) -> Result<Rgba, String> {
-    let hex = raw
-        .strip_prefix('#')
-        .ok_or_else(|| format!("colour {raw:?} must start with '#'"))?;
+    let hex = raw.strip_prefix('#').ok_or_else(|| format!("colour {raw:?} must start with '#'"))?;
     if !hex.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(format!("colour {raw:?} has a digit outside 0-9a-f"));
     }
@@ -47,11 +45,7 @@ fn parse_color(raw: &str) -> Result<Rgba, String> {
         4 => Rgba(widen(0), widen(1), widen(2), widen(3)),
         6 => Rgba(pair(0), pair(2), pair(4), 255),
         8 => Rgba(pair(0), pair(2), pair(4), pair(6)),
-        digits => {
-            return Err(format!(
-                "colour {raw:?} has {digits} digits; expected 3, 4, 6 or 8"
-            ))
-        }
+        digits => return Err(format!("colour {raw:?} has {digits} digits; expected 3, 4, 6 or 8")),
     })
 }
 

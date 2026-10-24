@@ -1,0 +1,5 @@
+# The width the source has always been written to. rustfmt's default heuristics would
+# split a great deal of it, so they are lifted to their maximum: calls, struct literals and
+# chains stay on one line as long as the width allows, which is how the rest of it reads.
+max_width = 100
+use_small_heuristics = "Max"
