@@ -316,7 +316,7 @@ impl Ui {
     /// Brings the on-screen cards in line with the shared queue. The only place
     /// cards are created, destroyed or re-stacked.
     pub fn sync(&mut self) {
-        let items: Vec<Notification> = {
+        let (items, dismissed): (Vec<Notification>, Vec<u32>) = {
             let mut store = self.store.lock().unwrap();
             if store.items.len() > render::MAX_CARDS {
                 for dropped in store.items.drain(render::MAX_CARDS..) {
@@ -325,7 +325,9 @@ impl Ui {
                         .try_send(CloseRequest { id: dropped.id, reason: REASON_EXPIRED });
                 }
             }
-            store.items.clone()
+            // Taken rather than read: each dismissal is one departure, and every card in the
+            // queue has been looked at by the time this function returns.
+            (store.items.clone(), std::mem::take(&mut store.dismissed))
         };
 
         // Keep the cards that still exist, in queue order, building the new ones.
@@ -354,7 +356,11 @@ impl Ui {
                 Anim::Leaving(..) if !card.leaving_done(now) => ordered.push(card),
                 Anim::Leaving(..) => {}
                 _ if self.config.animation.enabled => {
-                    card.anim.leave(Exit::Expired);
+                    // A card the command line asked to dismiss leaves the way a click does:
+                    // the user asked for it, so it fades instead of sliding away.
+                    let exit =
+                        if dismissed.contains(&card.id) { Exit::Dismissed } else { Exit::Expired };
+                    card.anim.leave(exit);
                     ordered.push(card);
                 }
                 _ => {}

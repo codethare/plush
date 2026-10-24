@@ -84,7 +84,7 @@ place, in which case the bus starts the daemon first and there is then nothing t
 | Expiry | per-notification; `-1` becomes 5000 ms, `0` never expires |
 | Hold | a pointer inside a panel pauses its timeout; leaving resumes with the time that was left |
 | Countdown | a 2 px line along one edge showing how much of the timeout is left — inside the bottom edge unless `[countdown] position` moves it; a notification that never expires has none |
-| Animation | arrives over 520 ms from the nearest edge, fading up and growing from 96% of its size into a slight overshoot; a panel that expires slides back out over 260 ms, and one that is clicked fades where it stands in 180 ms |
+| Animation | arrives over 520 ms from the nearest edge, fading up and growing from 96% of its size into a slight overshoot; a panel that expires slides back out over 260 ms, and one the user dismisses fades where it stands in 180 ms |
 | `replaces_id` | replaces the content in place and restarts the timeout |
 | Dismiss | pointer press, `CloseNotification`, or `plush dismiss` |
 | Closing reasons | `1` expired, `2` dismissed by user, `3` `CloseNotification` |
@@ -196,8 +196,9 @@ before it settles. Which edge it comes from follows `[panel] position`.
 
 It leaves by the cheaper of two motions, chosen by what ended it. A panel that expires —
 or that is dropped because the stack is full — slides back out along its edge over 260 ms
-while fading. A panel that is clicked fades where it stands over 180 ms, without
-travelling: the user has already said what they want. Neither departure overshoots or
+while fading. A panel that the user asked for — clicked, or dismissed with `plush dismiss` —
+fades where it stands over 180 ms, without travelling: the user has already said what they
+want. Neither departure overshoots or
 changes size. The durations are fixed; there is no speed setting.
 
 The clock starts when the panel has arrived, not when the notification did, so a client's

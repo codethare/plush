@@ -131,6 +131,10 @@ pub struct CloseRequest {
 #[derive(Default)]
 pub struct Store {
     pub items: Vec<Notification>,
+    /// Ids the user asked to close from outside the panel — `plush dismiss` — waiting for the
+    /// UI thread to take them. The reason a panel leaves is chosen there, and this is the only
+    /// way the command line can say "the user asked for this" rather than "it disappeared".
+    pub dismissed: Vec<u32>,
     next_id: u32,
 }
 
@@ -192,7 +196,11 @@ impl Control {
         if ids.is_empty() {
             return;
         }
-        self.store.lock().unwrap().items.retain(|n| !ids.contains(&n.id));
+        {
+            let mut store = self.store.lock().unwrap();
+            store.items.retain(|n| !ids.contains(&n.id));
+            store.dismissed.extend(ids.iter().copied());
+        }
         for id in ids {
             let _ = self.closed.try_send(CloseRequest { id, reason: REASON_DISMISSED });
         }
@@ -368,6 +376,21 @@ mod tests {
         let request = requests.try_recv().expect("a close was announced");
         assert_eq!(request.id, 3);
         assert_eq!(request.reason, REASON_DISMISSED);
+    }
+
+    /// The UI thread learns why a panel is going away from the store, so a dismissal from the
+    /// command line leaves the way a click does rather than the way a timeout does.
+    #[test]
+    fn a_dismissal_records_that_the_user_asked() {
+        let (control, store, _requests) = control();
+
+        control.dismiss();
+        assert_eq!(store.lock().unwrap().dismissed, vec![3], "the one that went");
+
+        control.dismiss_all();
+        let mut dismissed = store.lock().unwrap().dismissed.clone();
+        dismissed.sort_unstable();
+        assert_eq!(dismissed, vec![1, 2, 3], "and then the rest");
     }
 
     #[test]
