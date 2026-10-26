@@ -21,3 +21,9 @@ wayland-client = "0.31"
 zbus = "5.19"
 zvariant = "5.15"
 
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
