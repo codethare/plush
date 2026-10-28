@@ -84,7 +84,7 @@ place, in which case the bus starts the daemon first and there is then nothing t
 | Expiry | per-notification; `-1` becomes 5000 ms, `0` never expires |
 | Hold | a pointer inside a panel pauses its timeout; leaving resumes with the time that was left |
 | Countdown | a 2 px line along one edge showing how much of the timeout is left — inside the bottom edge unless `[countdown] position` moves it; a notification that never expires has none |
-| Animation | arrives over 520 ms from the nearest edge, fading up and growing from 96% of its size into a slight overshoot; a panel that expires slides back out over 260 ms, and one the user dismisses fades where it stands in 180 ms |
+| Animation | arrives over 520 ms from the nearest edge, fading up and sliding a few pixels past its resting place before settling; a panel that expires slides back out over 260 ms, and one the user dismisses fades where it stands in 180 ms |
 | `replaces_id` | replaces the content in place and restarts the timeout |
 | Dismiss | pointer press, `CloseNotification`, or `plush dismiss` |
 | Closing reasons | `1` expired, `2` dismissed by user, `3` `CloseNotification` |
@@ -191,8 +191,9 @@ then falls back to a colour-emoji space seventeen pixels wide and leaves a hole 
 Arriving and leaving are two different motions, and leaving has two shapes of its own.
 
 A panel arrives over 520 ms: it slides in from just past the nearest edge, fading up and
-growing from 96% of its resting size, overshooting that size by a fraction of a percent
-before it settles. Which edge it comes from follows `[panel] position`.
+travelling a few pixels past its resting place before settling back onto it. Which edge it
+comes from follows `[panel] position`. Nothing about a frame changes the panel's size: it is
+drawn by copying a raster that was made once, which is why a frame costs what it covers.
 
 It leaves by the cheaper of two motions, chosen by what ended it. A panel that expires —
 or that is dropped because the stack is full — slides back out along its edge over 260 ms
@@ -340,18 +341,18 @@ end, because `wl_shm`'s `Argb8888` is BGRA in memory while `tiny-skia` paints RG
   still the pre-configuration look.
 - The animation is covered by unit tests for each phase's duration and curve, and for the way
   a pose maps to pixels: nothing is visible at 0, the panel is a half-width to the right at
-  0.5, only the arrival overshoots (by under 1%, and inside the shadow margin it is drawn in),
-  a departure never changes size, and a settled panel is painted exactly as it was before
-  animations existed. A timeout's clock is covered by tests asserting it does not start until
+  0.5, only the arrival overshoots (a few pixels, inside the shadow margin it is drawn in),
+  a departure never changes size, and a settled panel is drawn by copying its raster byte for
+  byte. A timeout's clock is covered by tests asserting it does not start until
   the panel has arrived, that a hold taken before then starts nothing, and that the countdown
   line is at full length while the panel is still coming in.
-- Measured against a headless sway with the protocol traced: 17 ms between frames (60 Hz),
-  roughly 15 frames to arrive and 12 to leave (measured against the 220 ms motion of the
-  time, so the arrival and both departures now run longer — see the animation section), and
-  with `enabled = false` three paints in
-  2 ms and a quarter of the CPU for a panel that never expires, against about twenty paints
-  a second while a countdown line is draining. Four panels animating at once allocate no
-  extra buffers, leak no surfaces, and log no `wl_display` errors.
+- CPU is measured against a headless sway (`WLR_BACKENDS=headless`, `WLR_RENDERER=pixman`) from
+  `/proc/<pid>/stat`, with the release profile in `Cargo.toml`. Nothing on screen costs 0.0%,
+  and a panel with a timeout costs 1.8% at 2× and 0.8% at 1× — it used to cost 41.6% and
+  17.0%, because every 50 ms repaint composited the whole card through a resampler to advance
+  a 2 px line. One arrival costs 50–130 ms of CPU at 2× and 30 ms at 1×, against 440–510 ms
+  before. Four panels animating at once allocate no extra buffers, leak no surfaces, and log
+  no `wl_display` errors. With `enabled = false` three paints take 2 ms.
 - The CLI is exercised end to end against a live daemon: `plush dismiss` closes exactly the
   top panel and `plush dismiss all` the rest, each announced as reason `2`; the surfaces are
   painted and destroyed without a `wl_display` error, dismissing a panel mid-animation works,

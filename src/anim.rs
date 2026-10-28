@@ -25,8 +25,23 @@ const EXIT_SLIDE: Duration = Duration::from_millis(260);
 /// want, so there is nothing left for the motion to explain.
 const EXIT_FADE: Duration = Duration::from_millis(180);
 
-/// How much smaller than its resting size a card starts its arrival, before growing into it.
-const ENTER_SCALE: f32 = 0.96;
+/// How far past its resting place an arriving card travels, as a share of the edge it comes
+/// along, before settling back onto it. It is a share rather than a distance because the motion
+/// is drawn in buffer pixels, and both edges it can travel along are bounded — so this stays
+/// inside the shadow margin on the shortest panel (2.8 px) and on the widest (9.9 px), with the
+/// margin at 26.
+const OVERSHOOT: f32 = 0.025;
+
+/// The recoil of the arrival's ease. Its peak above 1 is `4·p³ / (27·(p+1)²)`, and the
+/// assertion below is that this value makes that peak `OVERSHOOT`. The vendored 1.70158 recoils
+/// by a tenth of the distance, which on a 396 px buffer would travel 40 px past rest — further
+/// than the shadow margin, so the panel would be clipped as it settled.
+const ENTER_RECOIL: f32 = 0.825;
+const _: () = {
+    let peak = 4.0 * ENTER_RECOIL * ENTER_RECOIL * ENTER_RECOIL
+        / (27.0 * (ENTER_RECOIL + 1.0) * (ENTER_RECOIL + 1.0));
+    assert!((peak - OVERSHOOT).abs() < 0.0005);
+};
 
 /// Why a card is leaving, which is what decides how it leaves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -46,21 +61,21 @@ impl Exit {
     }
 }
 
-/// What a frame needs to know about the motion: how far the card has travelled, how visible
-/// it is, and how big.
+/// What a frame needs to know about the motion: how far the card has moved and how visible it
+/// is. A card never changes size, which is what keeps every frame a copy rather than a resample.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Pose {
     /// 1 fully opaque, 0 gone.
     pub opacity: f32,
-    /// Share of the edge distance still to travel: 0 is at rest. A click never travels.
+    /// Share of the edge distance between the card and its resting place, signed: positive is
+    /// outside the edge, 0 is at rest, negative is past rest — which is the arrival's overshoot.
+    /// A click never travels.
     pub travel: f32,
-    /// Scale about the card's own centre: 1 is at rest.
-    pub scale: f32,
 }
 
 impl Pose {
     /// Standing still, fully drawn.
-    const RESTING: Self = Self { opacity: 1.0, travel: 0.0, scale: 1.0 };
+    pub const RESTING: Self = Self { opacity: 1.0, travel: 0.0 };
 }
 
 /// Where a card is in its life.
@@ -127,13 +142,13 @@ impl Anim {
             Self::Settled => Pose::RESTING,
             Self::Entering(_) => {
                 let fraction = self.fraction(now);
-                let progress = ease_out(fraction);
                 Pose {
-                    opacity: progress,
-                    travel: 1.0 - progress,
-                    // Overshoot only on the way in, and only in scale: a card at rest fills
-                    // its surface, so travelling past rest would clip its far edge.
-                    scale: ENTER_SCALE + (1.0 - ENTER_SCALE) * ease_out_back(fraction),
+                    // The fade is monotone even though the travel is not: a fade that overshot
+                    // would read as a flash rather than as a settle.
+                    opacity: ease_out(fraction),
+                    // Travels past the resting place and comes back. Overshoot only on the way
+                    // in; a departure has nothing left to emphasise.
+                    travel: 1.0 - ease_out_back(fraction),
                 }
             }
             Self::Leaving(_, exit) => {
@@ -144,8 +159,6 @@ impl Anim {
                         Exit::Expired => progress,
                         Exit::Dismissed => 0.0,
                     },
-                    // A departure never changes size: there is nothing left to emphasise.
-                    scale: 1.0,
                 }
             }
         }
@@ -169,10 +182,11 @@ fn ease_out(fraction: f32) -> f32 {
     1.0 - (1.0 - fraction).powi(3)
 }
 
-/// Ease out with a recoil: overshoots past 1 and comes back to it, by about a tenth.
-/// Only ever used for the arrival's scale, where an overshoot reads as a settle.
+/// Ease out with a recoil: passes 1 by `OVERSHOOT` of the distance and comes back to it. Only
+/// ever used for the arrival's travel, where passing the resting place reads as a settle.
+///
 fn ease_out_back(fraction: f32) -> f32 {
-    const C1: f32 = 1.701_58;
+    const C1: f32 = ENTER_RECOIL;
     const C3: f32 = C1 + 1.0;
     let t = fraction - 1.0;
     1.0 + C3 * t * t * t + C1 * t * t
@@ -182,7 +196,7 @@ fn ease_out_back(fraction: f32) -> f32 {
 mod tests {
     use super::*;
 
-    /// The peak of `ease_out_back`, which is where the arrival's scale reaches its largest.
+    /// The peak of `ease_out_back`, which is how far past rest the arrival travels.
     fn overshoot_peak() -> f32 {
         let (mut peak, mut at) = (0.0, 0.0);
         for step in 0..=1000 {
@@ -214,7 +228,6 @@ mod tests {
         let first = anim.pose(start);
         assert_eq!(first.travel, 1.0, "arrives from nothing");
         assert_eq!(first.opacity, 0.0, "invisibly");
-        assert_eq!(first.scale, ENTER_SCALE, "and smaller than it will be");
 
         let last = anim.pose(start + ENTER);
         assert_eq!(last, Pose::RESTING, "settles exactly at rest");
@@ -224,39 +237,41 @@ mod tests {
         assert!(anim.finished(start + ENTER));
     }
 
-    /// The arrival is the only motion that overshoots, and only in scale: the card is drawn
-    /// slightly larger than its resting size before it settles.
+    /// The arrival is the only motion that overshoots, and it does it by travelling past its
+    /// resting place rather than by changing size: nothing is resampled, so a frame stays a
+    /// plain copy.
     #[test]
-    fn the_arrival_overshoots_its_resting_size() {
+    fn the_arrival_travels_past_its_resting_place() {
         let start = Instant::now();
         let anim = Anim::Entering(start);
-        let mut peak: f32 = 1.0;
+        let mut peak: f32 = 0.0;
         let mut previous_opacity = 0.0;
-        let mut previous_travel = 1.0;
         for step in 0..=200 {
             let pose = anim.pose(start + ENTER * step / 200);
-            peak = peak.max(pose.scale);
+            peak = peak.min(pose.travel);
             assert!(pose.opacity >= previous_opacity, "the fade never goes backwards");
-            assert!(pose.travel <= previous_travel, "and neither does the travel");
             previous_opacity = pose.opacity;
-            previous_travel = pose.travel;
         }
-        assert!(peak > 1.0, "the card grows past its resting size, peaked at {peak}");
-        assert!(peak <= 1.01, "but only just, peaked at {peak}");
+        assert!(peak < 0.0, "the card passes its resting place, reached {peak}");
+        let expected = overshoot_peak() - 1.0;
+        assert!((-peak - expected).abs() < 1e-3, "by the curve's own peak: {peak}");
+        assert!((-peak - OVERSHOOT).abs() < 1e-3, "which is the share asked for: {peak}");
     }
 
-    /// The overshoot is drawn inside the shadow margin the surface already carries, so it
-    /// cannot be clipped. Anything up to the margin's width fits; this is far inside it.
+    /// The overshoot has to fit inside the shadow margin the surface already carries, on the
+    /// shortest edge it can travel along and on the widest, or the panel is clipped while it
+    /// settles.
     #[test]
     fn the_overshoot_fits_inside_the_shadow_margin() {
-        let growth = (ENTER_SCALE + (1.0 - ENTER_SCALE) * overshoot_peak() - 1.0)
-            * crate::render::PANEL_W as f32
-            / 2.0;
-        assert!(
-            growth < crate::render::SHADOW as f32,
-            "the overshoot would need {growth} px, the margin carries {}",
-            crate::render::SHADOW
-        );
+        // The edges a card can travel along are the buffer's own: the widest panel's width,
+        // and the shortest panel's height, both counting the shadow margin on either side.
+        let margin = crate::render::SHADOW as f32;
+        let wide = crate::render::surface(crate::render::PANEL_W, crate::render::MIN_H).0 as f32;
+        let short = crate::render::surface(crate::render::PANEL_W, crate::render::MIN_H).1 as f32;
+        for edge in [wide, short] {
+            let travel = (overshoot_peak() - 1.0) * edge;
+            assert!(travel < margin, "the overshoot would need {travel} px on a {edge} px edge");
+        }
     }
 
     #[test]
@@ -285,7 +300,7 @@ mod tests {
         assert!(!anim.finished(departed));
         assert!(anim.finished(departed + EXIT_SLIDE));
         // Gone, and a full edge away: a timeout leaves rather than dissolving in place.
-        let gone = Pose { opacity: 0.0, travel: 1.0, scale: 1.0 };
+        let gone = Pose { opacity: 0.0, travel: 1.0 };
         assert_eq!(anim.pose(departed + EXIT_SLIDE), gone);
         assert_eq!(anim.pose(departed + EXIT_SLIDE * 10), gone);
     }
@@ -304,7 +319,6 @@ mod tests {
             let mut previous = 1.0;
             for step in 0..=20 {
                 let pose = anim.pose(start + duration * step / 20);
-                assert_eq!(pose.scale, 1.0, "{exit:?} changes size at step {step}");
                 assert!(pose.opacity <= previous, "{exit:?} brightens at step {step}");
                 assert_eq!(pose.travel > 0.0, travels, "{exit:?} travels the wrong way");
                 previous = pose.opacity;

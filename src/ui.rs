@@ -25,7 +25,7 @@ use smithay_client_toolkit::{
         },
         WaylandSurface,
     },
-    shm::{slot::SlotPool, Shm, ShmHandler},
+    shm::{slot, slot::SlotPool, Shm, ShmHandler},
 };
 use tiny_skia::Pixmap;
 use wayland_client::{
@@ -53,9 +53,12 @@ const GAP: i32 = 16;
 const _: () = assert!(GAP as u32 > render::SHADOW_REACH_UP);
 /// One animation frame. 60 Hz, which is what the motion was tuned against.
 const FRAME: Duration = Duration::from_millis(16);
-/// One tick of the countdown. 20 Hz, which is enough for the line to read as draining
-/// rather than stepping, and cheap enough to run for the length of a notification.
+/// The fastest the countdown may be repainted. It is a floor rather than a clock: a line that
+/// moves less than a pixel in that time is not worth a frame, and one that moves more is
+/// repainted at this rate as it always was.
 const TICK: Duration = Duration::from_millis(50);
+/// The slowest it may be repainted, so a long timeout still looks alive next to a short one.
+const TICK_SLOWEST: Duration = Duration::from_millis(200);
 
 /// What a close reason means for the motion. A click is the user asking for the panel to go,
 /// so it leaves without travelling; everything else — a timeout, a full stack, a
@@ -143,6 +146,17 @@ struct Card {
     /// is the first frame after the compositor has said how big the card is; it never goes
     /// stale, because a card that changes size is built again on a fresh surface.
     frame: Option<Pixmap>,
+    /// The buffer this card last attached, and the rectangle the countdown line covered in it.
+    /// A countdown repaint draws into that buffer again — which is only allowed once the
+    /// compositor has released it — so that advancing a 2 px line costs the line's rows rather
+    /// than the whole panel.
+    drawn: Option<Drawn>,
+}
+
+/// What a card last put on screen, so a countdown tick can rework it in place.
+struct Drawn {
+    buffer: slot::Buffer,
+    line: Option<(i32, i32, i32, i32)>,
 }
 
 /// What a card was built from. A change in any of it means the card is rebuilt rather
@@ -439,6 +453,7 @@ impl Ui {
             timeouts,
             anim,
             frame: None,
+            drawn: None,
             size: None,
             scale,
         }
@@ -522,16 +537,10 @@ impl Ui {
         // the density the card advertised with `set_buffer_scale`.
         let scale = self.cards[index].scale;
         let (width, height) = (logical_w * scale, logical_h * scale);
-        let stride = width as i32 * 4;
-        let Ok((buffer, canvas)) =
-            self.pool.create_buffer(width as i32, height as i32, stride, wl_shm::Format::Argb8888)
-        else {
-            return false;
-        };
-
         let now = Instant::now();
+
         // The rest frame is rasterised once, on the first frame after the compositor has said
-        // how big the card is; every frame after that, moving or not, composites it.
+        // how big the card is; every frame after that draws from it.
         if self.cards[index].frame.is_none() {
             let card = &mut self.cards[index];
             let frame = render::rest_frame(
@@ -546,6 +555,22 @@ impl Ui {
             );
             card.frame = Some(frame);
         }
+
+        // A card that is standing still and only moving its countdown line rewrites the rows
+        // the line occupies, in the buffer it already put on screen, and damages those rows.
+        // Everything else — a moving card, or one whose buffer the compositor still holds —
+        // takes the full path.
+        if self.repaint_line(index, width, height, scale, now) {
+            return true;
+        }
+
+        let stride = width as i32 * 4;
+        let Ok((buffer, canvas)) =
+            self.pool.create_buffer(width as i32, height as i32, stride, wl_shm::Format::Argb8888)
+        else {
+            return false;
+        };
+
         let card = &mut self.cards[index];
         let remaining = card.timeouts.fraction(now);
         let Some(frame) = card.frame.as_ref() else {
@@ -567,6 +592,71 @@ impl Ui {
             return false;
         }
         card.surface.commit();
+
+        let drawn =
+            render::line_bounds(width, height, &self.config, remaining.unwrap_or(0.0), scale);
+        self.cards[index].drawn = Some(Drawn { buffer, line: drawn });
+        true
+    }
+
+    /// Repaints just the countdown line of a card that is standing still, into the buffer it
+    /// last attached — and reports whether that is what happened.
+    ///
+    /// It is not what happens when the card is moving, has no line, has never been drawn, or
+    /// when the compositor has not released its last buffer: the caller then draws in full,
+    /// which is what keeps this from being a race with the compositor.
+    fn repaint_line(
+        &mut self,
+        index: usize,
+        width: u32,
+        height: u32,
+        scale: u32,
+        now: Instant,
+    ) -> bool {
+        if self.cards[index].anim.running() {
+            return false;
+        }
+        let now_remaining = self.cards[index].timeouts.fraction(now);
+        let Some(remaining) = now_remaining else {
+            return false;
+        };
+        let Some(drawn) = self.cards[index].drawn.take() else {
+            return false;
+        };
+        // Giving the buffer back is what allows its pixels to be touched again; when the
+        // compositor still holds it there is nothing to do but draw in full.
+        let Some(canvas) = self.pool.canvas(&drawn.buffer) else {
+            self.cards[index].drawn = Some(drawn);
+            return false;
+        };
+        let canvas = &mut canvas[..width as usize * height as usize * 4];
+        let Some(frame) = self.cards[index].frame.as_ref() else {
+            self.cards[index].drawn = Some(drawn);
+            return false;
+        };
+        let painted = render::repaint_line(
+            canvas,
+            width,
+            height,
+            frame.data(),
+            &self.config,
+            remaining,
+            scale,
+            drawn.line,
+        );
+        let Some(area) = painted else {
+            self.cards[index].drawn = Some(drawn);
+            return false;
+        };
+
+        let surface = self.cards[index].surface.wl_surface().clone();
+        surface.damage_buffer(area.0, area.1, area.2 - area.0, area.3 - area.1);
+        if drawn.buffer.attach_to(&surface).is_err() {
+            self.cards[index].drawn = Some(drawn);
+            return false;
+        }
+        surface.commit();
+        self.cards[index].drawn = Some(Drawn { buffer: drawn.buffer, line: Some(area) });
         true
     }
 
@@ -704,8 +794,41 @@ impl Ui {
         if self.tick.is_some() || !self.draining() {
             return;
         }
-        let timer = calloop::timer::Timer::from_duration(TICK);
+        let timer = calloop::timer::Timer::from_duration(self.tick_interval());
         self.tick = self.handle.insert_source(timer, |_, _, ui: &mut Ui| ui.ticks()).ok();
+    }
+
+    /// How long until a countdown line would visibly change: one pixel of its span, from the
+    /// line's own arithmetic, so a long timeout stops repainting twenty times a second for a
+    /// line that moves once a second.
+    fn tick_interval(&self) -> Duration {
+        let mut soonest = TICK_SLOWEST;
+        for card in &self.cards {
+            if card.anim.running() {
+                continue;
+            }
+            let Some(timeout) = card.timeouts.timeout else {
+                continue;
+            };
+            // The line's whole span in buffer pixels, and the timeout it drains over, give the
+            // time one pixel of it takes to drain.
+            let Some((x0, y0, x1, y1)) =
+                render::line_bounds(render::PANEL_W, render::MIN_H, &self.config, 1.0, card.scale)
+            else {
+                continue;
+            };
+            // A vertical line drains over the height and a horizontal one over the width.
+            let span = match self.config.countdown.position {
+                crate::config::Edge::Top | crate::config::Edge::Bottom => (x1 - x0).max(0),
+                _ => (y1 - y0).max(0),
+            } as u32;
+            if span == 0 || timeout.is_zero() {
+                continue;
+            }
+            let per_pixel = timeout / span;
+            soonest = soonest.min(per_pixel.max(TICK));
+        }
+        soonest
     }
 
     /// Whether any card on screen has a countdown running.
@@ -1014,6 +1137,25 @@ mod tests {
         assert_eq!(timeouts.deadline, Some(left + Duration::from_secs(5)));
         assert!(!timeouts.expired(left + Duration::from_millis(4999)));
         assert!(timeouts.expired(left + Duration::from_secs(5)));
+    }
+
+    /// The countdown is repainted when its line would move a pixel, not on a clock: a long
+    /// timeout stops costing twenty frames a second for a line that takes a second to move.
+    #[test]
+    fn the_tick_follows_the_line() {
+        let ui_interval = |timeout: Duration| {
+            // The same arithmetic `tick_interval` does, against the default layout's span.
+            let (x0, _, x1, _) =
+                render::line_bounds(render::PANEL_W, render::MIN_H, &Config::default(), 1.0, 1)
+                    .expect("a full line");
+            let span = (x1 - x0).max(1) as u32;
+            (timeout / span).max(TICK).min(TICK_SLOWEST)
+        };
+
+        assert_eq!(ui_interval(Duration::from_secs(5)), TICK, "a short line moves each tick");
+        assert_eq!(ui_interval(Duration::from_secs(600)), TICK_SLOWEST, "and a long one waits");
+        let twenty = ui_interval(Duration::from_secs(20));
+        assert!(twenty > TICK && twenty < TICK_SLOWEST, "20 s drains in between: {twenty:?}");
     }
 
     /// A panel with no timeout never starts one, however it arrived.

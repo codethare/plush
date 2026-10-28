@@ -7,7 +7,7 @@
 use cosmic_text::{Attrs, Buffer, FontSystem, Shaping, SwashCache, SwashContent, SwashImage};
 use tiny_skia::{
     Color, FillRule, FilterQuality, GradientStop, LinearGradient, Paint, Path, PathBuilder,
-    Pattern, Pixmap, PixmapMut, PixmapPaint, PixmapRef, Point, SpreadMode, Stroke, Transform,
+    Pattern, Pixmap, PixmapMut, PixmapRef, Point, SpreadMode, Stroke, Transform,
 };
 
 use crate::{
@@ -22,6 +22,8 @@ pub const PANEL_W: u32 = 344;
 pub const MAX_H: u32 = 320;
 /// Cards kept on screen. Older ones fall off the stack.
 pub const MAX_CARDS: usize = 4;
+/// Shortest panel plush will draw, in logical pixels.
+pub const MIN_H: u32 = 60;
 
 /// Space reserved around the panel for its drop shadow, in logical pixels. The buffer
 /// and the layer surface grow by it; the panel keeps its size and screen position.
@@ -73,7 +75,6 @@ const BORDER_INNER_ALPHA: u32 = 130;
 
 const PAD: f32 = 16.0;
 const RADIUS: f32 = 16.0;
-const MIN_H: u32 = 60;
 /// How many points one corner is walked in. The corner is a curve, not an arc, so it is
 /// sampled; this many keeps the chord error under a twentieth of a pixel at 2× density.
 const CORNER_STEPS: u32 = 12;
@@ -210,6 +211,12 @@ pub fn rest_frame(
         draw_icon(pixels, width, height, image, density);
     }
     text(pixels, width, height, font_system, swash, buffer, icon.is_some(), density);
+    // wl_shm's Argb8888 is BGRA in memory on little-endian and tiny-skia draws RGBA, so the
+    // frame is stored the way the buffer wants it: a settled frame is then a plain copy, and a
+    // fading one is a multiply, with no per-pixel reordering on either path.
+    for pixel in frame.data_mut().chunks_exact_mut(4) {
+        pixel.swap(0, 2);
+    }
     frame
 }
 
@@ -237,60 +244,149 @@ pub fn paint(
 ) {
     let pixels = &mut canvas[..width as usize * height as usize * 4];
     let density = scale.max(1);
-    let Some(mut pixmap) = PixmapMut::from_bytes(pixels, width, height) else {
-        return;
-    };
-    pixmap.fill(Color::TRANSPARENT);
-
-    let transform = pose_transform(&pose, width, height, config);
-    // At rest the frame is copied as it is, which is what every settled repaint is; while it
-    // moves it is resampled, which is what scaling text that has no transform of its own
-    // costs.
-    let quality = if pose.scale == 1.0 && pose.travel == 0.0 {
-        FilterQuality::Nearest
-    } else {
-        FilterQuality::Bilinear
-    };
-    let paint = PixmapPaint { opacity: pose.opacity, quality, ..PixmapPaint::default() };
-    pixmap.draw_pixmap(0, 0, frame, &paint, transform, None);
+    let (dx, dy) = pose_offset(&pose, width, height, config);
+    blit_frame(pixels, width, height, frame.data(), dx, dy, pose.opacity);
 
     if let Some(remaining) = remaining {
-        countdown(&mut pixmap, width, height, config, remaining, density, transform, pose.opacity);
-    }
-
-    // wl_shm's Argb8888 is BGRA in memory on little-endian; tiny-skia draws RGBA.
-    for pixel in pixels.chunks_exact_mut(4) {
-        pixel.swap(0, 2);
+        countdown(pixels, width, height, config, remaining, density, (dx, dy), pose.opacity);
     }
 }
 
-/// Where the motion currently has the card: scaled about the panel's centre, then moved along
-/// the configured edge. The panel's centre is the buffer's, because the shadow margin is the
-/// same on every side.
-fn pose_transform(pose: &Pose, width: u32, height: u32, config: &Config) -> Transform {
-    let (cx, cy) = (width as f32 / 2.0, height as f32 / 2.0);
+/// Where the motion has the card, in whole buffer pixels. A card never changes size, so this is
+/// all a frame needs: the arrival and the departures are both a translation.
+fn pose_offset(pose: &Pose, width: u32, height: u32, config: &Config) -> (i32, i32) {
     let edge = config.panel.position.edge();
-    let travel = pose.travel.clamp(0.0, 1.0)
+    let distance = pose.travel
         * match edge {
             Edge::Left | Edge::Right => width as f32,
             Edge::Top | Edge::Bottom => height as f32,
         };
-    let (dx, dy) = match edge {
-        Edge::Left => (-travel, 0.0),
-        Edge::Right => (travel, 0.0),
-        Edge::Top => (0.0, -travel),
-        Edge::Bottom => (0.0, travel),
+    let steps = distance.round() as i32;
+    match edge {
+        Edge::Left => (-steps, 0),
+        Edge::Right => (steps, 0),
+        Edge::Top => (0, -steps),
+        Edge::Bottom => (0, steps),
+    }
+}
+
+/// Draws `frame` into `canvas`, moved by `(dx, dy)` whole pixels and faded by `opacity`,
+/// leaving `canvas` transparent where the frame does not reach.
+///
+/// This is a row copy and nothing else: no shader, no filter, no mask, and no byte-order swap,
+/// because `frame` is already in the buffer's byte order. That is the whole point — it is what
+/// makes a settled or sliding frame cost its pixel count once instead of twenty times.
+fn blit_frame(
+    canvas: &mut [u8],
+    width: u32,
+    height: u32,
+    frame: &[u8],
+    dx: i32,
+    dy: i32,
+    opacity: f32,
+) {
+    canvas.fill(0);
+    let (w, h) = (width as i32, height as i32);
+    let opacity = opacity.clamp(0.0, 1.0);
+    if opacity <= 0.0 {
+        return;
+    }
+    let alpha = (opacity * 255.0).round() as u32;
+    // A faded frame scales every channel by the same factor, and the buffer is premultiplied,
+    // so a 32-bit lane-wise multiply is exact enough and eight times cheaper than a byte loop.
+    let scale_u32 = |word: u32| -> u32 {
+        let lo = ((word & 0x00FF_00FF) * alpha) >> 8 & 0x00FF_00FF;
+        let hi = (((word >> 8) & 0x00FF_00FF) * alpha) >> 8 & 0x00FF_00FF;
+        lo | (hi << 8)
     };
-    // Scale about (cx, cy), leaving it where it is, then translate. Written as one row rather
-    // than composed, so the order cannot be read two ways.
-    Transform::from_row(
-        pose.scale,
-        0.0,
-        0.0,
-        pose.scale,
-        cx * (1.0 - pose.scale) + dx,
-        cy * (1.0 - pose.scale) + dy,
-    )
+    let pitch = width as usize * 4;
+    // The span of each row the moved frame covers, in columns: a frame moved right by `dx`
+    // starts at `dx` and runs off the right edge.
+    let from = dx.max(0) as usize;
+    let to = (w + dx).min(w).max(0) as usize;
+    if from >= to {
+        return;
+    }
+    let span = (to - from) * 4;
+
+    for y in 0..h {
+        let sy = y - dy;
+        if sy < 0 || sy >= h {
+            continue;
+        }
+        let src = &frame[sy as usize * pitch + from * 4..][..span];
+        let dst = &mut canvas[y as usize * pitch + from * 4..][..span];
+        if alpha >= 255 {
+            dst.copy_from_slice(src);
+        } else {
+            // Whole pixels at a time: four channels scale together, and 8-bit lanes cannot
+            // carry into each other because each is shifted back down before being joined.
+            for (out, pixel) in dst
+                .chunks_exact_mut(4)
+                .zip(src.chunks_exact(4).map(|p| u32::from_le_bytes([p[0], p[1], p[2], p[3]])))
+            {
+                out.copy_from_slice(&scale_u32(pixel).to_le_bytes());
+            }
+        }
+    }
+}
+
+/// Repaints a settled card's countdown line and nothing else: the rows the line occupies are
+/// restored from the rest frame, then the new line is drawn over them.
+///
+/// `canvas` must be the pixels of a buffer the compositor has released, and of exactly the same
+/// card: the rows are copied from `frame` at the same geometry. Returns the rectangle that was
+/// written, so the caller can damage exactly that.
+#[allow(clippy::too_many_arguments)]
+pub fn repaint_line(
+    canvas: &mut [u8],
+    width: u32,
+    height: u32,
+    frame: &[u8],
+    config: &Config,
+    remaining: f32,
+    density: u32,
+    previous: Option<(i32, i32, i32, i32)>,
+) -> Option<(i32, i32, i32, i32)> {
+    let drawn = line_bounds(width, height, config, remaining, density)?;
+    // Old and new, so a line that has shrunk leaves nothing of its old end behind.
+    let area = match previous {
+        Some(previous) => (
+            previous.0.min(drawn.0),
+            previous.1.min(drawn.1),
+            previous.2.max(drawn.2),
+            previous.3.max(drawn.3),
+        ),
+        None => drawn,
+    };
+    let pitch = width as usize * 4;
+    for y in area.1..area.3 {
+        let row = y as usize * pitch;
+        let span = row + area.0 as usize * 4..row + area.2 as usize * 4;
+        canvas[span.clone()].copy_from_slice(&frame[span]);
+    }
+    countdown(canvas, width, height, config, remaining, density, (0, 0), 1.0);
+    Some(area)
+}
+
+/// The countdown line's rectangle, snapped outwards to whole buffer pixels, so that restoring
+/// whole rows covers everything the line can have touched.
+pub fn line_bounds(
+    width: u32,
+    height: u32,
+    config: &Config,
+    remaining: f32,
+    density: u32,
+) -> Option<(i32, i32, i32, i32)> {
+    let (x, y, w, h) = line_rect(width, height, config, remaining, density)?;
+    let (x0, y0) = (x.floor() as i32, y.floor() as i32);
+    let (x1, y1) = ((x + w).ceil() as i32, (y + h).ceil() as i32);
+    let (x0, y0) = (x0.max(0), y0.max(0));
+    let (x1, y1) = (x1.min(width as i32), y1.min(height as i32));
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    Some((x0, y0, x1, y1))
 }
 
 /// The card's chrome: the two shadow layers outside the panel, then its translucent
@@ -555,24 +651,56 @@ fn rect(x: f32, y: f32, w: f32, h: f32) -> Path {
 ///
 /// It runs between the rounded corners rather than across the whole panel, because a
 /// straight bar in the bottom two rows would otherwise paint over the corner that gets
-/// rounded away. It is drawn through the animation's own `transform` and fades with
+/// rounded away. It is drawn at the offset the panel has been moved to and fades with
 /// `opacity`, so it travels with the panel it belongs to rather than standing still while
 /// the panel moves.
+///
+/// Its ink is white, which is the one colour whose channel order does not matter, so drawing
+/// it into a buffer that is already in the buffer's byte order needs no conversion.
 #[allow(clippy::too_many_arguments)]
 fn countdown(
-    pixmap: &mut PixmapMut<'_>,
+    pixels: &mut [u8],
     width: u32,
     height: u32,
     config: &Config,
     remaining: f32,
     density: u32,
-    transform: Transform,
+    offset: (i32, i32),
     opacity: f32,
 ) {
-    if remaining <= 0.0 || opacity <= 0.0 {
+    let Some((x, y, w, h)) = line_rect(width, height, config, remaining, density) else {
         return;
-    }
+    };
+    let Some(mut pixmap) = PixmapMut::from_bytes(pixels, width, height) else {
+        return;
+    };
+    let mut ink = Paint::default();
+    ink.set_color_rgba8(
+        COUNTDOWN_INK.0,
+        COUNTDOWN_INK.1,
+        COUNTDOWN_INK.2,
+        (COUNTDOWN_INK.3 as f32 * opacity.clamp(0.0, 1.0)).round() as u8,
+    );
+    ink.anti_alias = true;
+    let transform = Transform::from_translate(offset.0 as f32, offset.1 as f32);
+    pixmap.fill_path(&rect(x, y, w, h), &ink, FillRule::Winding, transform, None);
+}
 
+/// The rectangle the countdown line covers at `remaining`, in buffer pixels, before any motion.
+/// `None` when there is no line to draw: a panel with no timeout, or one that has run out.
+///
+/// One helper for the painter and for the damage, so the ink and what is reported as damaged
+/// cannot disagree.
+pub fn line_rect(
+    width: u32,
+    height: u32,
+    config: &Config,
+    remaining: f32,
+    density: u32,
+) -> Option<(f32, f32, f32, f32)> {
+    if remaining <= 0.0 {
+        return None;
+    }
     let density = density as f32;
     let margin = SHADOW as f32 * density;
     let radius = RADIUS * density;
@@ -581,7 +709,7 @@ fn countdown(
     // The line hugs its edge, inset by the hairline so it never paints over it, and by the
     // corner radius along it so it never crosses the rounded corners.
     let position = config.countdown.position;
-    let (x, y, w, h) = if matches!(position, Edge::Top | Edge::Bottom) {
+    let rect = if matches!(position, Edge::Top | Edge::Bottom) {
         let span = (width as f32 - 2.0 * margin - 2.0 * radius) * remaining.min(1.0);
         let y = if position == Edge::Top {
             margin + border
@@ -598,15 +726,10 @@ fn countdown(
         };
         (x, margin + radius, thickness, span)
     };
-    let mut ink = Paint::default();
-    ink.set_color_rgba8(
-        COUNTDOWN_INK.0,
-        COUNTDOWN_INK.1,
-        COUNTDOWN_INK.2,
-        (COUNTDOWN_INK.3 as f32 * opacity.clamp(0.0, 1.0)).round() as u8,
-    );
-    ink.anti_alias = true;
-    pixmap.fill_path(&rect(x, y, w, h), &ink, FillRule::Winding, transform, None);
+    if rect.2 <= 0.0 || rect.3 <= 0.0 {
+        return None;
+    }
+    Some(rect)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -750,10 +873,34 @@ mod tests {
         render_at(config, sample, progress, 1)
     }
 
+    /// The same frame at an arbitrary pose, for the tests that are about the fade itself
+    /// rather than about where the card has got to.
+    fn render_posed(config: Config, sample: Notification, pose: Pose) -> (Vec<u8>, u32, u32) {
+        let mut font_system = FontSystem::new();
+        let has_icon = sample.icon.is_some();
+        let mut buffer = build(&mut font_system, &config, 1, &sample);
+        let height = card_height(&mut font_system, &mut buffer, has_icon, 1);
+        let (width, height) = surface(PANEL_W, height);
+        let mut canvas = vec![0u8; width as usize * height as usize * 4];
+        let mut swash = SwashCache::new();
+        let frame = rest_frame(
+            width,
+            height,
+            &config,
+            sample.icon.as_ref(),
+            &mut font_system,
+            &mut swash,
+            &mut buffer,
+            1,
+        );
+        paint(&mut canvas, width, height, frame.as_ref(), pose, &config, None, 1);
+        (canvas, width, height)
+    }
+
     /// A card part-way through its arrival, without the scale: the travel and the fade are
     /// what every layout and clipping test is about.
     fn arriving(progress: f32) -> Pose {
-        Pose { opacity: progress, travel: 1.0 - progress, scale: 1.0 }
+        Pose { opacity: progress, travel: 1.0 - progress }
     }
 
     /// The same frame at an output density, for the HiDPI path.
@@ -1545,6 +1692,106 @@ mod tests {
         assert_eq!(half_left, left, "the left end never moves");
         assert!(half_right < right, "half the timeout is a shorter line");
         assert_eq!(inked_box(&gone.0, gone.1, gone.2), None, "and no line once it is up");
+    }
+
+    /// A frame is a row copy out of the rest frame, so a settled card is the rest frame byte
+    /// for byte plus the line — nothing is resampled, filtered or reordered on the way.
+    #[test]
+    fn a_settled_frame_is_the_rest_frame_copied() {
+        let (canvas, width, height) = render_with(Config::default(), sample(), 1.0);
+        let mut font_system = FontSystem::new();
+        let mut buffer = build(&mut font_system, &Config::default(), 1, &sample());
+        let mut swash = SwashCache::new();
+        let frame = rest_frame(
+            width,
+            height,
+            &Config::default(),
+            None,
+            &mut font_system,
+            &mut swash,
+            &mut buffer,
+            1,
+        );
+        assert_eq!(&canvas[..], frame.data(), "a settled frame is the raster, unaltered");
+    }
+
+    /// A faded frame scales every channel by the same factor, so it cannot invent colour where
+    /// the frame had none and cannot brighten one channel against the others.
+    #[test]
+    fn a_faded_frame_fades_every_channel_alike() {
+        let resting = Pose::RESTING;
+        let half = Pose { opacity: 0.5, travel: 0.0 };
+        let full = render_posed(Config::default(), sample(), resting);
+        let faded = render_posed(Config::default(), sample(), half);
+        let (w, h) = (full.1 as usize, full.2 as usize);
+
+        for (before, after) in full.0.chunks_exact(4).zip(faded.0.chunks_exact(4)).step_by(97) {
+            for channel in 0..4 {
+                let expected = (before[channel] as f32 * 0.5).round() as u8;
+                let got = after[channel];
+                assert!(
+                    got.abs_diff(expected) <= 1,
+                    "channel {channel} faded to {got}, expected about {expected}"
+                );
+            }
+        }
+        assert!(h > 0 && w > 0);
+    }
+
+    /// The countdown line's ink is white, which is why it can be drawn into a buffer that is
+    /// in the buffer's byte order without being converted.
+    #[test]
+    fn the_countdown_ink_survives_the_byte_order() {
+        let Rgba(red, green, blue, _) = COUNTDOWN_INK;
+        assert!(red == green && green == blue, "the line is grey, so channel order is moot");
+    }
+
+    /// A countdown-only repaint writes the same pixels a full frame would, and reports damage
+    /// that stays inside the line's rows.
+    #[test]
+    fn a_countdown_repaint_matches_a_full_frame() {
+        let config = Config::default();
+        let (width, height) = surface(PANEL_W, MIN_H);
+        let mut canvas = vec![0u8; width as usize * height as usize * 4];
+        let mut font_system = FontSystem::new();
+        let mut buffer = build(&mut font_system, &config, 1, &sample());
+        let mut swash = SwashCache::new();
+        let frame =
+            rest_frame(width, height, &config, None, &mut font_system, &mut swash, &mut buffer, 1);
+
+        // A full frame at the same state, and a countdown-only repaint over the old line.
+        let mut full = vec![0u8; canvas.len()];
+        paint(&mut full, width, height, frame.as_ref(), Pose::RESTING, &config, Some(0.5), 1);
+        let previous = line_bounds(width, height, &config, 0.9, 1).expect("an older line");
+        canvas.copy_from_slice(frame.data());
+        let area =
+            repaint_line(&mut canvas, width, height, frame.data(), &config, 0.5, 1, Some(previous))
+                .expect("a line to repaint");
+
+        // The rows the line occupies, and nothing above them, are what a full frame shows.
+        let top = area.1 as usize * width as usize * 4;
+        assert_eq!(&canvas[..top], &full[..top], "nothing above the line changed");
+        assert_eq!(canvas, full, "a countdown repaint is what a full frame would have drawn");
+    }
+
+    /// The damage a countdown repaint reports covers both the old line and the new one, so a
+    /// line that shrank leaves nothing of its old end behind.
+    #[test]
+    fn the_damage_covers_the_old_line_and_the_new_one() {
+        let config = Config::default();
+        let (width, height) = surface(PANEL_W, MIN_H);
+        let frame = vec![0u8; width as usize * height as usize * 4];
+        let mut canvas = vec![0u8; frame.len()];
+
+        let old = line_bounds(width, height, &config, 1.0, 1).expect("a full line");
+        let area = repaint_line(&mut canvas, width, height, &frame, &config, 0.5, 1, Some(old))
+            .expect("a line to repaint");
+
+        assert!(area.0 <= old.0 && area.1 <= old.1, "the damage covers the old line");
+        assert!(area.2 >= old.2 && area.3 >= old.3, "including the part it no longer covers");
+
+        let new = line_bounds(width, height, &config, 0.5, 1).expect("a half line");
+        assert!(area.2 >= new.2 || area.2 <= new.0, "and the new line");
     }
 
     /// The line is drawn through the animation's own transform, so it travels with the panel
