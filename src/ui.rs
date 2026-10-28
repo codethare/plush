@@ -850,7 +850,10 @@ impl Ui {
         }
 
         if self.draining() {
-            TimeoutAction::ToDuration(TICK)
+            // Re-armed from the line's own arithmetic, not from the floor: a timeout whose
+            // line has a second to go before it moves must not be repainted twenty times a
+            // second for nothing.
+            TimeoutAction::ToDuration(self.tick_interval())
         } else {
             // Like the frame timer, the source removes itself here, so the token goes
             // with it rather than being left to name a slot some later source reuses.
