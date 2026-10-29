@@ -183,6 +183,64 @@ pub fn card_height(
     ((text + 2.0 * pad).ceil() as u32).clamp((MIN_H * density).max(floor), MAX_H * density)
 }
 
+/// The chrome of a panel — its shadow, its body and its rims — rasterised once per size and
+/// density and kept, because none of it depends on what the panel says.
+///
+/// It is the expensive half of building a frame (13–43 ms at 2×) and it is the same for every
+/// card that happens to be the same size, which for one-, two- and three-line notifications is
+/// most of them. The configuration is read once at startup, so a cache that outlives a card but
+/// not the daemon cannot go stale behind a change of colours.
+pub struct Chromes {
+    entries: Vec<Chrome>,
+}
+
+/// How many sizes are worth keeping. A stack of four cards rarely has more than three distinct
+/// heights, and each entry is a panel-sized raster.
+const CHROMES_KEPT: usize = 4;
+
+struct Chrome {
+    width: u32,
+    height: u32,
+    density: u32,
+    pixels: Vec<u8>,
+}
+
+impl Default for Chromes {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Chromes {
+    pub fn new() -> Self {
+        Self { entries: Vec::new() }
+    }
+
+    /// How many sizes are cached, for the tests that pin the cap.
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// The chrome for a card of this size, rasterising it if this is the first one.
+    fn get(&mut self, width: u32, height: u32, config: &Config, density: u32) -> &[u8] {
+        if let Some(at) = self
+            .entries
+            .iter()
+            .position(|c| c.width == width && c.height == height && c.density == density)
+        {
+            return &self.entries[at].pixels;
+        }
+        let mut pixels = vec![0u8; width as usize * height as usize * 4];
+        panel(&mut pixels, width, height, config, density);
+        if self.entries.len() >= CHROMES_KEPT {
+            // Oldest first: a notification's size stops recurring long before its raster does.
+            self.entries.remove(0);
+        }
+        self.entries.push(Chrome { width, height, density, pixels });
+        &self.entries.last().expect("just pushed").pixels
+    }
+}
+
 /// Draws one panel at rest into a fresh pixmap: the shadow, the body, its rims, the icon and
 /// the text, in premultiplied RGBA at `scale`.
 ///
@@ -194,6 +252,7 @@ pub fn card_height(
 /// every constant below is logical, so they are multiplied by it here.
 #[allow(clippy::too_many_arguments)]
 pub fn rest_frame(
+    chromes: &mut Chromes,
     width: u32,
     height: u32,
     config: &Config,
@@ -206,7 +265,7 @@ pub fn rest_frame(
     let density = scale.max(1);
     let mut frame = Pixmap::new(width, height).expect("plush: a card's buffer fits in memory");
     let pixels = frame.data_mut();
-    panel(pixels, width, height, config, density);
+    pixels.copy_from_slice(chromes.get(width, height, config, density));
     if let Some(image) = icon {
         draw_icon(pixels, width, height, image, density);
     }
@@ -884,6 +943,7 @@ mod tests {
         let mut canvas = vec![0u8; width as usize * height as usize * 4];
         let mut swash = SwashCache::new();
         let frame = rest_frame(
+            &mut Chromes::new(),
             width,
             height,
             &config,
@@ -919,6 +979,7 @@ mod tests {
         let mut canvas = vec![0u8; width as usize * height as usize * 4];
         let mut swash = SwashCache::new();
         let frame = rest_frame(
+            &mut Chromes::new(),
             width,
             height,
             &config,
@@ -948,8 +1009,17 @@ mod tests {
         let (width, height) = surface(PANEL_W, MIN_H);
         let mut canvas = vec![0u8; width as usize * height as usize * 4];
         let mut swash = SwashCache::new();
-        let frame =
-            rest_frame(width, height, &config, None, &mut font_system, &mut swash, &mut buffer, 1);
+        let frame = rest_frame(
+            &mut Chromes::new(),
+            width,
+            height,
+            &config,
+            None,
+            &mut font_system,
+            &mut swash,
+            &mut buffer,
+            1,
+        );
         paint(&mut canvas, width, height, frame.as_ref(), pose, &config, remaining, 1);
         (canvas, width, height)
     }
@@ -1694,6 +1764,65 @@ mod tests {
         assert_eq!(inked_box(&gone.0, gone.1, gone.2), None, "and no line once it is up");
     }
 
+    /// The chrome is kept between cards, so a warm cache must produce exactly the frame a cold
+    /// one would: the cache can only save work, never change what is drawn.
+    #[test]
+    fn a_cached_frame_is_the_same_as_an_uncached_one() {
+        for density in [1u32, 2] {
+            let config = Config::default();
+            let mut cold = Chromes::new();
+            let mut warm = Chromes::new();
+            let draw = |chromes: &mut Chromes| {
+                let mut font_system = FontSystem::new();
+                let mut buffer = build(&mut font_system, &config, density, &sample());
+                let height = card_height(&mut font_system, &mut buffer, false, density);
+                let (width, height) = surface(PANEL_W, height.div_ceil(density));
+                let (width, height) = (width * density, height * density);
+                let mut swash = SwashCache::new();
+                rest_frame(
+                    chromes,
+                    width,
+                    height,
+                    &config,
+                    None,
+                    &mut font_system,
+                    &mut swash,
+                    &mut buffer,
+                    density,
+                )
+            };
+
+            let first = draw(&mut cold);
+            // Twice into the warm cache: the second call is the one that reads the entry.
+            let _ = draw(&mut warm);
+            let second = draw(&mut warm);
+            assert_eq!(
+                first.data(),
+                second.data(),
+                "a warm cache drew something else at {density}×"
+            );
+        }
+    }
+
+    /// The cache is bounded, and it evicts rather than growing with every notification.
+    #[test]
+    fn the_chrome_cache_keeps_a_bounded_number_of_sizes() {
+        let config = Config::default();
+        let mut chromes = Chromes::new();
+        for height in 0..(CHROMES_KEPT as u32 + 3) {
+            let (width, tall) = surface(PANEL_W, MIN_H + height * 10);
+            chromes.get(width, tall, &config, 1);
+            assert!(chromes.len() <= CHROMES_KEPT, "the cache grew past its cap");
+        }
+        assert_eq!(chromes.len(), CHROMES_KEPT, "and it stays full, evicting the oldest");
+
+        // Asking again for a size still present is a hit, not a new entry.
+        let (width, tall) = surface(PANEL_W, MIN_H);
+        let before = chromes.len();
+        chromes.get(width, tall, &config, 1);
+        assert_eq!(chromes.len(), before, "a hit does not add an entry");
+    }
+
     /// A frame is a row copy out of the rest frame, so a settled card is the rest frame byte
     /// for byte plus the line — nothing is resampled, filtered or reordered on the way.
     #[test]
@@ -1703,6 +1832,7 @@ mod tests {
         let mut buffer = build(&mut font_system, &Config::default(), 1, &sample());
         let mut swash = SwashCache::new();
         let frame = rest_frame(
+            &mut Chromes::new(),
             width,
             height,
             &Config::default(),
@@ -1756,8 +1886,17 @@ mod tests {
         let mut font_system = FontSystem::new();
         let mut buffer = build(&mut font_system, &config, 1, &sample());
         let mut swash = SwashCache::new();
-        let frame =
-            rest_frame(width, height, &config, None, &mut font_system, &mut swash, &mut buffer, 1);
+        let frame = rest_frame(
+            &mut Chromes::new(),
+            width,
+            height,
+            &config,
+            None,
+            &mut font_system,
+            &mut swash,
+            &mut buffer,
+            1,
+        );
 
         // A full frame at the same state, and a countdown-only repaint over the old line.
         let mut full = vec![0u8; canvas.len()];

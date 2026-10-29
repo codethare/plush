@@ -348,11 +348,13 @@ end, because `wl_shm`'s `Argb8888` is BGRA in memory while `tiny-skia` paints RG
   line is at full length while the panel is still coming in.
 - CPU is measured against a headless sway (`WLR_BACKENDS=headless`, `WLR_RENDERER=pixman`) from
   `/proc/<pid>/stat`, with the release profile in `Cargo.toml`. Nothing on screen costs 0.0%,
-  and a panel with a timeout costs 1.8% at 2× and 0.8% at 1× — it used to cost 41.6% and
-  17.0%, because every 50 ms repaint composited the whole card through a resampler to advance
-  a 2 px line. One arrival costs 50–130 ms of CPU at 2× and 30 ms at 1×, against 440–510 ms
-  before. Four panels animating at once allocate no extra buffers, leak no surfaces, and log
-  no `wl_display` errors. With `enabled = false` three paints take 2 ms.
+  and a panel with a timeout costs 0.2% at 2× — it used to cost 41.6%, because every 50 ms
+  repaint composited the whole card through a resampler to advance a 2 px line. One arrival
+  costs 20–30 ms of CPU at 2×, against 440–510 ms. Four panels animating at once allocate no
+  extra buffers, leak no surfaces, and log no `wl_display` errors. With `enabled = false` three
+  paints take 2 ms.
+- The release profile is built for speed, not size: this is a renderer whose frames are byte
+  copies, and `opt-level = "z"` costs about four times that work for a binary a third smaller.
 - The CLI is exercised end to end against a live daemon: `plush dismiss` closes exactly the
   top panel and `plush dismiss all` the rest, each announced as reason `2`; the surfaces are
   painted and destroyed without a `wl_display` error, dismissing a panel mid-animation works,

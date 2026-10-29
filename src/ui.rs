@@ -279,6 +279,9 @@ pub struct Ui {
     config: Config,
     font_system: FontSystem,
     swash: SwashCache,
+    /// Panel chrome, rasterised once per distinct size and density. Lives as long as the
+    /// daemon, which is also as long as the configuration it was drawn with.
+    chromes: render::Chromes,
     store: Shared,
     closed: async_channel::Sender<CloseRequest>,
     cards: Vec<Card>,
@@ -317,6 +320,7 @@ impl Ui {
             config,
             font_system: FontSystem::new(),
             swash: SwashCache::new(),
+            chromes: render::Chromes::new(),
             store,
             closed,
             cards: Vec::new(),
@@ -544,6 +548,7 @@ impl Ui {
         if self.cards[index].frame.is_none() {
             let card = &mut self.cards[index];
             let frame = render::rest_frame(
+                &mut self.chromes,
                 width,
                 height,
                 &self.config,
