@@ -213,6 +213,23 @@ impl Timeouts {
         Self { timeout, pending: timeout, deadline: None, held: None }
     }
 
+    /// Hands a card that kept its text a client's new timeout, which a rebuilt card would
+    /// have got from `new`. A timeout that did not change is not a restart, so a replacement
+    /// that merely re-asserts it does not buy the card more time. A card still arriving
+    /// starts the new clock when it arrives; a held one waits for the pointer to leave.
+    fn restart(&mut self, timeout: Option<Duration>, settled: bool, now: Instant) {
+        if self.timeout == timeout {
+            return;
+        }
+        let held = self.held.is_some();
+        *self = Self::new(timeout);
+        if held {
+            self.hold(now);
+        } else if settled {
+            self.start(now);
+        }
+    }
+
     /// Starts the clock, once the card is on screen and at rest. A card that is already held,
     /// or that has already started, is left alone.
     fn start(&mut self, now: Instant) {
@@ -374,7 +391,17 @@ impl Ui {
                 .iter()
                 .position(|card| card.id == notification.id && card.source.matches(notification));
             match unchanged {
-                Some(index) => ordered.push(self.cards.remove(index)),
+                Some(index) => {
+                    let mut card = self.cards.remove(index);
+                    // The text is the same, but the client may still have asked for another
+                    // timeout, which has to reach the card that stays.
+                    card.timeouts.restart(
+                        notification.timeout,
+                        card.anim == Anim::Settled,
+                        Instant::now(),
+                    );
+                    ordered.push(card);
+                }
                 None => {
                     self.cards.retain(|card| card.id != notification.id);
                     ordered.push(self.make_card(notification, 1));
@@ -1293,6 +1320,46 @@ mod tests {
         assert_eq!(timeouts.fraction(start + Duration::from_secs(1)), Some(0.75));
         assert_eq!(timeouts.fraction(start + Duration::from_secs(4)), Some(0.0));
         assert_eq!(timeouts.fraction(start + Duration::from_secs(9)), Some(0.0));
+    }
+
+    /// A `replaces_id` whose text is unchanged still hands the card the client's new
+    /// timeout: the old deadline and the old denominator are what the countdown had wrong.
+    #[test]
+    fn a_replaced_timeout_restarts_the_countdown() {
+        let start = Instant::now();
+        let mut timeouts = Timeouts::new(Some(Duration::from_secs(10)));
+        timeouts.start(start);
+
+        let replaced = start + Duration::from_secs(8);
+        timeouts.restart(Some(Duration::from_secs(3)), true, replaced);
+        assert_eq!(timeouts.deadline, Some(replaced + Duration::from_secs(3)));
+        assert_eq!(timeouts.fraction(replaced), Some(1.0), "the line is full again");
+        assert!(!timeouts.expired(replaced + Duration::from_secs(2)));
+        assert!(timeouts.expired(replaced + Duration::from_secs(3)));
+
+        // The same timeout is not a restart: it does not buy the card more time.
+        timeouts.restart(Some(Duration::from_secs(3)), true, replaced + Duration::from_secs(1));
+        assert_eq!(timeouts.deadline, Some(replaced + Duration::from_secs(3)));
+    }
+
+    /// A new timeout on a card that is still arriving or held starts when the card is at
+    /// rest and unheld, rather than behind the arrival or the pointer's back.
+    #[test]
+    fn a_replaced_timeout_waits_for_the_panel_or_the_pointer() {
+        let start = Instant::now();
+
+        let mut timeouts = Timeouts::new(Some(Duration::from_secs(10)));
+        timeouts.restart(Some(Duration::from_secs(3)), false, start);
+        assert_eq!(timeouts.deadline, None, "still arriving, so nothing runs yet");
+        assert_eq!(timeouts.remaining(start), Some(Duration::from_secs(3)));
+
+        let mut timeouts = Timeouts::new(Some(Duration::from_secs(10)));
+        timeouts.start(start);
+        let held = start + Duration::from_secs(1);
+        timeouts.hold(held);
+        timeouts.restart(Some(Duration::from_secs(4)), true, held + Duration::from_secs(5));
+        assert_eq!(timeouts.deadline, None, "the pointer still holds it");
+        assert_eq!(timeouts.remaining(held + Duration::from_secs(5)), Some(Duration::from_secs(4)));
     }
 
     /// A `replaces_id` that changes only the icon still has to rebuild the card, or the
