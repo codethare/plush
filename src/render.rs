@@ -360,21 +360,22 @@ fn blit_frame(
     };
     let pitch = width as usize * 4;
     // The span of each row the moved frame covers, in columns: a frame moved right by `dx`
-    // starts at `dx` and runs off the right edge.
-    let from = dx.max(0) as usize;
-    let to = (w + dx).min(w).max(0) as usize;
-    if from >= to {
+    // starts at `dx` and reads from the frame's left edge, and the reverse when it moves left.
+    let start = dx.max(0) as usize;
+    let read = (-dx).max(0) as usize;
+    let to = (w + dx.min(0)).min(w).max(0) as usize;
+    if start >= to {
         return;
     }
-    let span = (to - from) * 4;
+    let span = (to - start) * 4;
 
     for y in 0..h {
         let sy = y - dy;
         if sy < 0 || sy >= h {
             continue;
         }
-        let src = &frame[sy as usize * pitch + from * 4..][..span];
-        let dst = &mut canvas[y as usize * pitch + from * 4..][..span];
+        let src = &frame[sy as usize * pitch + read * 4..][..span];
+        let dst = &mut canvas[y as usize * pitch + start * 4..][..span];
         if alpha >= 255 {
             dst.copy_from_slice(src);
         } else {
@@ -1471,6 +1472,29 @@ mod tests {
             canvas.chunks_exact(4).all(|pixel| pixel[3] == 0),
             "nothing may be visible before the card has arrived"
         );
+    }
+
+    /// A slide moves the frame's content, not only its outline: a marker inside the frame
+    /// lands `dx` further along the canvas, in either direction.
+    #[test]
+    fn a_slid_frame_takes_its_content_with_it() {
+        let (w, h) = (16u32, 4u32);
+        let pitch = w as usize * 4;
+        let mut frame = vec![0u8; pitch * h as usize];
+        // An opaque white pixel at column 8 of the frame's first row.
+        frame[8 * 4..9 * 4].copy_from_slice(&[255, 255, 255, 255]);
+        let mut canvas = vec![0u8; frame.len()];
+
+        for (dx, expected) in [(4, 12usize), (-4, 4usize)] {
+            blit_frame(&mut canvas, w, h, &frame, dx, 0, 1.0);
+            let lit: Vec<usize> = canvas
+                .chunks_exact(4)
+                .enumerate()
+                .filter(|(_, pixel)| pixel[0] > 0)
+                .map(|(index, _)| index)
+                .collect();
+            assert_eq!(lit, vec![expected], "a frame moved by {dx} px moves its content too");
+        }
     }
 
     #[test]
