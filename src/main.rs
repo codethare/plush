@@ -4,7 +4,7 @@ mod dbus;
 mod render;
 mod ui;
 
-use std::time::Duration;
+use std::{ffi::OsString, time::Duration};
 
 use calloop::{ping::make_ping, EventLoop};
 use calloop_wayland_source::WaylandSource;
@@ -100,11 +100,21 @@ fn parse(args: &[&str]) -> Result<Command, String> {
     }
 }
 
-fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+/// The command line without the program name. A word that is not valid UTF-8 is a usage
+/// error rather than the panic `std::env::args` would raise.
+fn arguments(args: impl IntoIterator<Item = OsString>) -> Result<Vec<String>, String> {
+    args.into_iter()
+        .map(|arg| arg.into_string().map_err(|_| "argument is not valid UTF-8".to_string()))
+        .collect()
+}
 
-    match parse(&borrowed) {
+fn main() {
+    let command = arguments(std::env::args_os().skip(1)).and_then(|args| {
+        let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+        parse(&borrowed)
+    });
+
+    match command {
         Ok(Command::Daemon) => run_daemon(),
         Ok(Command::Dismiss(what)) => {
             if let Err(err) = dbus::request_dismiss(what) {
@@ -188,6 +198,16 @@ fn run_daemon() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A word that is not valid UTF-8 must be reported, not panic the process.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_argument_is_a_usage_error() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let args = vec![OsString::from_vec(vec![b'd', 0xff])];
+        assert_eq!(arguments(args).unwrap_err(), "argument is not valid UTF-8");
+    }
 
     #[test]
     fn no_arguments_runs_the_daemon() {
