@@ -250,6 +250,22 @@ impl Timeouts {
         self.deadline.is_some_and(|deadline| deadline <= now)
     }
 
+    /// The deadline this card is still waiting on, in the phase it is in. A card on its way
+    /// out has already been announced as closed, so its deadline is spent: it arms no timer.
+    fn deadline_for(&self, anim: &Anim) -> Option<Instant> {
+        if anim.leaving() {
+            None
+        } else {
+            self.deadline
+        }
+    }
+
+    /// Whether the timeout has run out for a card in this phase. A card on its way out is
+    /// never expired again, for the same reason it arms no timer.
+    fn expired_for(&self, anim: &Anim, now: Instant) -> bool {
+        !anim.leaving() && self.expired(now)
+    }
+
     /// How much of the client's timeout is left, which is the length of the countdown
     /// line. `None` for a card that never expires, which has no line to draw.
     fn fraction(&self, now: Instant) -> Option<f32> {
@@ -484,7 +500,7 @@ impl Ui {
         let expired: Vec<u32> = self
             .cards
             .iter()
-            .filter(|card| card.timeouts.expired(now))
+            .filter(|card| card.timeouts.expired_for(&card.anim, now))
             .map(|card| card.id)
             .collect();
         if expired.is_empty() {
@@ -506,7 +522,8 @@ impl Ui {
         if let Some(token) = self.expiry.take() {
             self.handle.remove(token);
         }
-        let deadline = self.cards.iter().filter_map(|card| card.timeouts.deadline).min();
+        let deadline =
+            self.cards.iter().filter_map(|card| card.timeouts.deadline_for(&card.anim)).min();
         let Some(deadline) = deadline else {
             return;
         };
@@ -1219,6 +1236,28 @@ mod tests {
         assert_eq!(timeouts.deadline, Some(start + Duration::from_secs(62)));
         assert!(!timeouts.expired(start + Duration::from_secs(61)));
         assert!(timeouts.expired(start + Duration::from_secs(62)));
+    }
+
+    /// A card on its way out has already been announced as closed: its deadline is spent,
+    /// so it arms no timer and is never expired a second time.
+    #[test]
+    fn a_departing_card_never_expires_again() {
+        let start = Instant::now();
+        let mut timeouts = Timeouts::new(Some(Duration::from_secs(5)));
+        timeouts.start(start);
+        let deadline = start + Duration::from_secs(5);
+
+        // Still here: the deadline is the one it started with, and it runs out.
+        assert_eq!(timeouts.deadline_for(&Anim::Settled), Some(deadline));
+        assert!(timeouts.expired_for(&Anim::Settled, deadline));
+
+        let leaving = Anim::Leaving(start, Exit::Expired);
+        assert_eq!(timeouts.deadline_for(&leaving), None, "it arms no timer");
+        assert!(timeouts.expired(deadline), "the deadline itself has passed");
+        assert!(
+            !timeouts.expired_for(&leaving, deadline),
+            "but a departing card is not expired again"
+        );
     }
 
     /// A card the client asked to never expire has no countdown to freeze, so a hold is
